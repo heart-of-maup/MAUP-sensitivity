@@ -1283,12 +1283,10 @@ plot_and_save <- function(
       stop("rds_path must be a single string path.")
     if (!file.exists(rds_path))
       stop(sprintf("File does not exist: %s", rds_path))
+    
     result_obj <- readRDS(rds_path)
     message(sprintf("✓ Read successfully: %s", normalizePath(rds_path, mustWork = FALSE)))
     
-    # If filename_prefix is not specified, use the rds filename (without extension) 
-    # as the default output prefix, so the plots will be automatically saved in the 
-    # same directory as the data for easy management.
     if (is.null(filename_prefix)) {
       filename_prefix <- tools::file_path_sans_ext(rds_path)
     }
@@ -1297,9 +1295,12 @@ plot_and_save <- function(
   # ── 1. Data validation and extraction ─────────────────────────────────────
   if (!is.list(result_obj))
     stop("result_obj must be a list (or a list read from an .rds file).")
-  if (!"origin_value"  %in% names(result_obj)) stop("result_obj is missing 'origin_value'.")
-  if (!"distribution"  %in% names(result_obj)) stop("result_obj is missing 'distribution'.")
-  if (!"value"         %in% colnames(result_obj$distribution)) stop("distribution is missing the 'value' column.")
+  if (!"origin_value" %in% names(result_obj))
+    stop("result_obj is missing 'origin_value'.")
+  if (!"distribution" %in% names(result_obj))
+    stop("result_obj is missing 'distribution'.")
+  if (!"value" %in% colnames(result_obj$distribution))
+    stop("distribution is missing the 'value' column.")
   
   origin_value <- result_obj$origin_value
   dist_df      <- result_obj$distribution
@@ -1312,13 +1313,32 @@ plot_and_save <- function(
   dist_df <- dist_df %>%
     mutate(ratio = value / origin_value)
   
+  # Keep only finite values for plotting
+  dist_df <- dist_df %>%
+    filter(is.finite(ratio))
+  
+  if (nrow(dist_df) == 0) {
+    stop("No finite ratio values available for plotting.")
+  }
+  
   # ── 3. Unify coordinate range & fix binwidth ──────────────────────────────
   if (is.null(x_range)) {
-    x_min   <- quantile(dist_df$ratio, 0.001, na.rm = TRUE)
-    x_max   <- quantile(dist_df$ratio, 0.999, na.rm = TRUE)
-    x_range <- c(x_min, x_max)
+    x_min <- quantile(dist_df$ratio, 0.001, na.rm = TRUE)
+    x_max <- quantile(dist_df$ratio, 0.999, na.rm = TRUE)
+    
+    # Fallback if the range collapses
+    if (!is.finite(x_min) || !is.finite(x_max) || x_min == x_max) {
+      x_center <- mean(dist_df$ratio, na.rm = TRUE)
+      x_range  <- c(x_center - 0.01, x_center + 0.01)
+    } else {
+      x_range <- c(x_min, x_max)
+    }
   }
+  
   fixed_binwidth <- (x_range[2] - x_range[1]) / bins
+  if (!is.finite(fixed_binwidth) || fixed_binwidth <= 0) {
+    fixed_binwidth <- 0.001
+  }
   
   # ── 4. Theme setup ────────────────────────────────────────────────────────
   base_theme <- switch(
@@ -1332,32 +1352,64 @@ plot_and_save <- function(
   # ── 5. Single plot factory function ───────────────────────────────────────
   make_panel <- function(df, k_level) {
     
+    df <- df %>% filter(is.finite(ratio))
+    
     if (nrow(df) == 0) {
       return(
         ggplot() +
-          annotate("text", x = 0.5, y = 0.5,
-                   label = paste0("k = ", k_level, "\n(No data)"),
-                   size = 5, family = base_family) +
+          annotate(
+            "text",
+            x = 0.5, y = 0.5,
+            label = paste0("k = ", k_level, "\n(No data)"),
+            size = 5,
+            family = base_family
+          ) +
           theme_void(base_family = base_family)
       )
     }
     
     std_val <- sd(df$ratio, na.rm = TRUE)
     
+    # Correct extraction: ggplot_build(... )$data[[1]]
     hist_data <- ggplot_build(
-      ggplot(df, aes(x = ratio)) + geom_histogram(binwidth = fixed_binwidth)
-    )$data
+      ggplot(df, aes(x = ratio)) +
+        geom_histogram(binwidth = fixed_binwidth)
+    )$data[[1]]
     
     dens_data <- ggplot_build(
-      ggplot(df, aes(x = ratio)) + geom_density(adjust = density_adjust)
-    )$data
+      ggplot(df, aes(x = ratio)) +
+        geom_density(adjust = density_adjust)
+    )$data[[1]]
     
-    scale_factor <- max(hist_data$count, na.rm = TRUE) /
+    hist_max <- if ("count" %in% names(hist_data)) {
+      max(hist_data$count, na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+    
+    dens_max <- if ("density" %in% names(dens_data)) {
       max(dens_data$density, na.rm = TRUE)
+    } else {
+      NA_real_
+    }
     
-    stats_label <- if (show_stats) paste0("SD = ", sprintf("%.4f", std_val)) else NULL
+    scale_factor <- if (
+      is.finite(hist_max) &&
+      is.finite(dens_max) &&
+      dens_max > 0
+    ) {
+      hist_max / dens_max
+    } else {
+      1
+    }
     
-    ggplot(df, aes(x = ratio)) +
+    stats_label <- if (show_stats) {
+      paste0("SD = ", sprintf("%.4f", std_val))
+    } else {
+      NULL
+    }
+    
+    p <- ggplot(df, aes(x = ratio)) +
       
       geom_histogram(
         binwidth  = fixed_binwidth,
@@ -1366,27 +1418,39 @@ plot_and_save <- function(
         color     = "white",
         linewidth = 0.3,
         aes(y = after_stat(count))
-      ) +
-      
-      geom_density(
-        aes(y = after_stat(density) * scale_factor),
-        color     = "blue",
-        linewidth = 1.2,
-        adjust    = density_adjust
-      ) +
-      
-      { if (!is.null(vline_at))
-        geom_vline(xintercept = vline_at, color = vline_color,
-                   linetype = "dashed", linewidth = 1)
-      } +
-      
+      )
+    
+    # Add density curve only when density is valid
+    if (is.finite(dens_max) && dens_max > 0) {
+      p <- p +
+        geom_density(
+          aes(y = after_stat(density) * scale_factor),
+          color     = "blue",
+          linewidth = 1.2,
+          adjust    = density_adjust
+        )
+    }
+    
+    if (!is.null(vline_at)) {
+      p <- p +
+        geom_vline(
+          xintercept = vline_at,
+          color      = vline_color,
+          linetype   = "dashed",
+          linewidth  = 1
+        )
+    }
+    
+    p <- p +
       coord_cartesian(xlim = x_range) +
       
-      scale_x_continuous(labels = scales::number_format(accuracy = 0.01)) +
+      scale_x_continuous(
+        labels = scales::number_format(accuracy = 0.0001)
+      ) +
       
       scale_y_continuous(
-        name     = "Frequency",
-        labels   = function(x) as.integer(x),
+        name   = "Frequency",
+        labels = function(x) as.integer(x),
         sec.axis = sec_axis(
           trans = ~ . / scale_factor,
           name  = "Density"
@@ -1406,6 +1470,8 @@ plot_and_save <- function(
         axis.text        = element_text(size = 8),
         panel.grid.minor = element_blank()
       )
+    
+    return(p)
   }
   
   # ── 6. Plot by k and save independently ───────────────────────────────────
@@ -1422,9 +1488,6 @@ plot_and_save <- function(
         paste0(tools::file_path_sans_ext(filename_prefix), ".", device)
       }
       
-      # Automatically create parent directories: when filename_prefix is derived 
-      # from rds_path (which might be in a nested directory), prevent ggsave 
-      # from failing due to missing directories.
       dir.create(dirname(fname), recursive = TRUE, showWarnings = FALSE)
       
       ggsave(
@@ -1441,5 +1504,5 @@ plot_and_save <- function(
     }
   }
   
-  invisible(if (k_order_max == 1) plots else plots)
+  invisible(if (k_order_max == 1) plots[[1]] else plots)
 }

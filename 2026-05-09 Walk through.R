@@ -13,7 +13,7 @@ library(ggplot2)
 library(spdep)
 
 # Set project directory
-project_dir <- "D:/Change_to_your_local_path/"
+project_dir <- "D:/Change_to_your_local_path"
 
 # Source the core sensitivity functions and plotting function
 source(file.path(project_dir, "2026-04-30 MAUP sensitivity.R"))
@@ -27,8 +27,8 @@ s0101_path <- file.path(project_dir, "data", "ACSST5Y2023.S0101-Data.xlsx")
 
 # 1. Load spatial data
 # Replace these file names with the actual shapefile names in your data folder
-county_shp <- paste0(project_dir, "data/US_county/tl_2023_us_county.shp")
-subcounty_shp <- paste0(project_dir, "data/US_subcounty/tl_2023_36_cousub.shp")
+county_shp <- file.path(project_dir, "data", "US_county", "tl_2023_us_county.shp")
+subcounty_shp <- file.path(project_dir, "data", "US_subcounty", "tl_2023_36_cousub.shp")
 
 # State FIPS codes used in the manuscript
 state_fips <- c(
