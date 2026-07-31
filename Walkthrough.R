@@ -1,7 +1,7 @@
 # On the sensitivities to the modifiable areal unit problem
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-05-09
+# 2026-07-02
 
 # 0. Setup
 library(geojsonio)
@@ -16,14 +16,19 @@ library(spdep)
 project_dir <- "D:/Change_to_your_local_path"
 
 # Source the core sensitivity functions and plotting function
-source(file.path(project_dir, "2026-04-30 MAUP sensitivity.R"))
+source(file.path(project_dir, "MAUP sensitivity.R"))
 
 dir.create(file.path(project_dir, "outputs"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(project_dir, "outputs", "rds"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(project_dir, "outputs", "figures"), recursive = TRUE, showWarnings = FALSE)
 
-s2701_path <- file.path(project_dir, "data", "ACSST5Y2023.S2701-Data.xlsx")
-s0101_path <- file.path(project_dir, "data", "ACSST5Y2023.S0101-Data.xlsx")
+rds_dir <- file.path(project_dir, "outputs", "rds")
+fig_dir <- file.path(project_dir, "outputs", "figures")
+
+# Parallel Monte Carlo settings.
+# Set use_parallel <- FALSE if you want the original serial behavior.
+use_parallel <- TRUE
+parallel_workers <- max(1L, parallel::detectCores(logical = TRUE) - 5L)
 
 # 1. Load spatial data
 # Replace these file names with the actual shapefile names in your data folder
@@ -97,6 +102,9 @@ col_ins_rate <-
 col_hh_inc_100k_plus <- 
   "Estimate!!Total!!Civilian noninstitutionalized population!!HOUSEHOLD INCOME (IN 2023 INFLATION-ADJUSTED DOLLARS)!!Total household population!!$100,000 and over"
 
+col_hh_income_total <- 
+  "Estimate!!Total!!Civilian noninstitutionalized population!!HOUSEHOLD INCOME (IN 2023 INFLATION-ADJUSTED DOLLARS)!!Total household population"
+
 # Extract and rename selected S2701 variables
 county_attr_s2701 <- s2701_raw %>%
   transmute(
@@ -104,7 +112,13 @@ county_attr_s2701 <- s2701_raw %>%
     pop_civ = parse_number(as.character(.data[[col_pop_civ]])),
     pop_insured = parse_number(as.character(.data[[col_pop_insured]])),
     ins_rate = parse_number(as.character(.data[[col_ins_rate]])) / 100,
-    hh_inc_100k_plus = parse_number(as.character(.data[[col_hh_inc_100k_plus]]))
+    hh_income_total = parse_number(as.character(.data[[col_hh_income_total]])),
+    hh_inc_100k_plus = parse_number(as.character(.data[[col_hh_inc_100k_plus]])),
+    hh_inc_100k_plus_rate = if_else(
+      !is.na(hh_income_total) & hh_income_total > 0,
+      hh_inc_100k_plus / hh_income_total,
+      NA_real_
+    )
   )
 
 
@@ -153,7 +167,9 @@ required_cols <- c(
   "pop_civ",
   "pop_insured",
   "ins_rate",
-  "hh_inc_100k_plus"
+  "hh_income_total",
+  "hh_inc_100k_plus",
+  "hh_inc_100k_plus_rate"
 )
 
 missing_cols <- setdiff(required_cols, names(county))
@@ -185,6 +201,17 @@ field_rules <- list(
     merge = "sum",
     split = "area_weighted"
   ),
+  hh_income_total = list(
+    merge = "sum",
+    split = "area_weighted"
+  ),
+  hh_inc_100k_plus_rate = list(
+    merge = list(
+      numerator = "hh_inc_100k_plus",
+      denominator = "hh_income_total"
+    ),
+    split = "keep"
+  ),
   ins_rate = list(
     merge = list(
       numerator = "pop_insured",
@@ -198,34 +225,47 @@ field_rules <- list(
 
 # Mean
 summary_mean <- function(x) {
+  # Compute the mean of a numeric vector while ignoring missing values.
   mean(x, na.rm = TRUE)
 }
 
 # Median
 summary_median <- function(x) {
+  # Compute the median of a numeric vector while ignoring missing values.
   median(x, na.rm = TRUE)
 }
 
 # Standard deviation
 summary_sd <- function(x) {
+  # Compute the standard deviation of a numeric vector while ignoring missing values.
   sd(x, na.rm = TRUE)
 }
 
 # Interquartile range
 summary_iqr <- function(x) {
+  # Compute the interquartile range of a numeric vector while ignoring missing values.
   IQR(x, na.rm = TRUE)
 }
 
 # Coefficient of variation
 summary_cv <- function(x) {
+  # Compute the coefficient of variation while ignoring missing values.
   sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE)
+}
+
+# Pearson correlation.
+# Use with summary_field = c("field_x", "field_y").
+summary_pearson <- function(x, y) {
+  # Compute the Pearson correlation between two numeric vectors using complete cases.
+  cor(x, y, use = "complete.obs", method = "pearson")
 }
 
 
 
 # ============================================================
 # 8. Merging sensitivity
-# First-order merging sensitivity of insurance rate in New York
+# Manuscript Example set I: first-order merging sensitivity of four summary statistics
+# of percentage insured in New York
 # ============================================================
 
 # ------------------------------------------------------------
@@ -251,40 +291,7 @@ message("Number of New York counties used for merging sensitivity: ", nrow(count
 
 
 # ------------------------------------------------------------
-# 8.2 Define output folders
-# ------------------------------------------------------------
-
-rds_dir <- file.path(project_dir, "outputs", "rds")
-fig_dir <- file.path(project_dir, "outputs", "figures")
-
-dir.create(rds_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
-
-
-# ------------------------------------------------------------
-# 8.3 Optional fallback for calculate_merge_complexity()
-# ------------------------------------------------------------
-
-# Some versions of the core function file call calculate_merge_complexity()
-# inside merging_sensitivity(). If it is not defined in the sourced file,
-# this fallback gives a conservative estimate based on rook-adjacent pairs.
-if (!exists("calculate_merge_complexity")) {
-  
-  calculate_merge_complexity <- function(sf, n_simulations = 200) {
-    
-    nb <- poly2nb(sf, queen = FALSE)
-    n_pairs <- sum(card(nb)) / 2
-    
-    data.frame(
-      k_order = 1:10,
-      estimated_total_combinations = n_pairs ^ (1:10)
-    )
-  }
-}
-
-
-# ------------------------------------------------------------
-# 8.4 Define merging analysis plan
+# 8.2 Define merging analysis plan
 # ------------------------------------------------------------
 
 merging_plan <- list(
@@ -308,7 +315,7 @@ merging_plan <- list(
 
 
 # ------------------------------------------------------------
-# 8.5 Run first-order merging sensitivity and save plots
+# 8.3 Run first-order merging sensitivity and save plots
 # ------------------------------------------------------------
 
 for (fig_id in names(merging_plan)) {
@@ -324,6 +331,8 @@ for (fig_id in names(merging_plan)) {
     exhaustive_threshold = Inf,
     n_iterations         = 100,
     random_seed          = 123,
+    parallel             = use_parallel,
+    n_workers            = parallel_workers,
     save_path            = file.path(rds_dir, paste0(fig_id, ".rds"))
   )
   
@@ -336,26 +345,17 @@ for (fig_id in names(merging_plan)) {
 
 # ============================================================
 # 9. Splitting sensitivity
-# First-order splitting sensitivity of the standard deviation
-# of insurance rate in NY, PA, OH, and MI
+# Manuscript Example set II: first-order splitting sensitivity of the standard deviation
+# of percentage insured in NY, PA, OH, and MI
 # ============================================================
 
 # ------------------------------------------------------------
-# 9.1 Define state FIPS codes
-# ------------------------------------------------------------
-
-state_fips <- c(
-  NY = "36",
-  PA = "42",
-  OH = "39",
-  MI = "26"
-)
-
-# ------------------------------------------------------------
-# 9.2 Helper function to prepare a state-level county layer
+# 9.1 Helper function to prepare a state-level county layer
 # ------------------------------------------------------------
 
 prepare_state_county <- function(sf_obj, statefp) {
+  # Prepare a state-level county layer with valid insurance fields and
+  # sequential IDs for sensitivity analysis.
   
   sf_obj %>%
     filter(STATEFP == statefp) %>%
@@ -372,7 +372,7 @@ prepare_state_county <- function(sf_obj, statefp) {
 }
 
 # ------------------------------------------------------------
-# 9.3 Create county layers for the four states
+# 9.2 Create county layers for the four states
 # ------------------------------------------------------------
 
 county_ny <- prepare_state_county(county, state_fips[["NY"]])
@@ -381,7 +381,7 @@ county_oh <- prepare_state_county(county, state_fips[["OH"]])
 county_mi <- prepare_state_county(county, state_fips[["MI"]])
 
 # ------------------------------------------------------------
-# 9.4 Define the splitting analysis plan
+# 9.3 Define the splitting analysis plan
 # ------------------------------------------------------------
 
 splitting_plan <- list(
@@ -404,7 +404,7 @@ splitting_plan <- list(
 )
 
 # ------------------------------------------------------------
-# 9.5 Run first-order splitting sensitivity and save plots
+# 9.4 Run first-order splitting sensitivity and save plots
 # ------------------------------------------------------------
 
 for (fig_id in names(splitting_plan)) {
@@ -426,6 +426,8 @@ for (fig_id in names(splitting_plan)) {
     k_order          = 1,
     n_iterations     = 100,
     random_seed      = 123,
+    parallel         = use_parallel,
+    n_workers        = parallel_workers,
     save_path        = file.path(rds_dir, paste0(fig_id, ".rds"))
   )
   
@@ -436,23 +438,127 @@ for (fig_id in names(splitting_plan)) {
 }
 
 # ============================================================
-# 10. Continuous sensitivity
-# Coefficient of variation of county population in New York
+# 10. High-order sensitivity
+# Manuscript Example set III: 1st-5th order merging and splitting sensitivities
+# of Pearson correlation between percentage insured and percentage high income
+# in New York
+# ============================================================
+
+# The S2701 table provides counts for total household population and
+# household population in the $100,000-and-over category. The percentage
+# variable used here is computed as:
+# hh_inc_100k_plus_rate = hh_inc_100k_plus / hh_income_total
+
+county_ny_high_order <- county %>%
+  filter(STATEFP == "36") %>%
+  filter(
+    !is.na(pop_civ),
+    !is.na(pop_insured),
+    !is.na(ins_rate),
+    !is.na(hh_income_total),
+    !is.na(hh_inc_100k_plus),
+    !is.na(hh_inc_100k_plus_rate)
+  ) %>%
+  mutate(
+    ID = row_number(),
+    ins_rate = if_else(ins_rate > 1, ins_rate / 100, ins_rate)
+  ) %>%
+  st_make_valid()
+
+high_order_fields <- c("ins_rate", "hh_inc_100k_plus_rate")
+high_order_k <- 1:5
+
+high_order_merging_results <- vector("list", length(high_order_k))
+names(high_order_merging_results) <- paste0("k", high_order_k)
+
+for (k in high_order_k) {
+  
+  message("Running high-order merging sensitivity: k = ", k)
+  
+  high_order_merging_results[[paste0("k", k)]] <- merging_sensitivity(
+    sf                   = county_ny_high_order,
+    field_rules          = field_rules,
+    summary_field        = high_order_fields,
+    summary_function     = summary_pearson,
+    k_order              = k,
+    exhaustive_threshold = 0,
+    n_iterations         = 100,
+    random_seed          = 1000 + k,
+    parallel             = use_parallel,
+    n_workers            = parallel_workers,
+    save_path            = file.path(rds_dir, paste0("fig_high_order_merging_k", k, ".rds"))
+  )
+}
+
+saveRDS(
+  high_order_merging_results,
+  file.path(rds_dir, "fig_high_order_merging_all_k.rds")
+)
+
+high_order_merging_plots <- plot_and_save(
+  result_obj      = high_order_merging_results,
+  filename_prefix = file.path(fig_dir, "fig_high_order_merging")
+)
+
+combine_sensitivity_plots(
+  plots    = high_order_merging_plots,
+  filename = file.path(fig_dir, "fig_high_order_merging_combined.png"),
+  ncol     = 1,
+  width    = 7,
+  height   = 26.25,
+  dpi      = 300,
+  device   = "png"
+)
+
+
+high_order_splitting_results <- vector("list", length(high_order_k))
+names(high_order_splitting_results) <- paste0("k", high_order_k)
+
+for (k in high_order_k) {
+  
+  message("Running high-order splitting sensitivity: k = ", k)
+  
+  high_order_splitting_results[[paste0("k", k)]] <- splitting_sensitivity(
+    sf               = county_ny_high_order,
+    field_rules      = field_rules,
+    summary_field    = high_order_fields,
+    summary_function = summary_pearson,
+    k_order          = k,
+    n_iterations     = 100,
+    random_seed      = 2000 + k,
+    parallel         = use_parallel,
+    n_workers        = parallel_workers,
+    save_path        = file.path(rds_dir, paste0("fig_high_order_splitting_k", k, ".rds"))
+  )
+}
+
+saveRDS(
+  high_order_splitting_results,
+  file.path(rds_dir, "fig_high_order_splitting_all_k.rds")
+)
+
+high_order_splitting_plots <- plot_and_save(
+  result_obj      = high_order_splitting_results,
+  filename_prefix = file.path(fig_dir, "fig_high_order_splitting")
+)
+
+combine_sensitivity_plots(
+  plots    = high_order_splitting_plots,
+  filename = file.path(fig_dir, "fig_high_order_splitting_combined.png"),
+  ncol     = 1,
+  width    = 7,
+  height   = 26.25,
+  dpi      = 300,
+  device   = "png"
+)
+# ============================================================
+# 11. Continuous sensitivity
+# Manuscript Example set IV: continuous reassignment sensitivity of the coefficient
+# of variation of county population in New York
 # ============================================================
 
 # ------------------------------------------------------------
-# 10.1 Define output folders
-# ------------------------------------------------------------
-
-rds_dir <- file.path(project_dir, "outputs", "rds")
-fig_dir <- file.path(project_dir, "outputs", "figures")
-
-dir.create(rds_dir, recursive = TRUE, showWarnings = FALSE)
-dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
-
-
-# ------------------------------------------------------------
-# 10.2 Prepare New York county layer
+# 11.1 Prepare New York county layer
 # ------------------------------------------------------------
 
 county_ny_continuous <- county %>%
@@ -477,7 +583,7 @@ message("Number of New York counties used for continuous sensitivity: ", nrow(co
 
 
 # ------------------------------------------------------------
-# 10.3 Calculate average county area
+# 11.2 Calculate average county area
 # ------------------------------------------------------------
 
 county_area_m2 <- as.numeric(st_area(county_ny_continuous))
@@ -497,7 +603,7 @@ message("Average New York county area: ", round(avg_county_area_km2, 2), " km^2"
 
 
 # ------------------------------------------------------------
-# 10.4 Define continuous sensitivity plan
+# 11.3 Define continuous sensitivity plan
 # ------------------------------------------------------------
 
 continuous_plan <- list(
@@ -521,14 +627,14 @@ continuous_plan <- list(
 
 
 # ------------------------------------------------------------
-# 10.5 Run continuous sensitivity and save plots
+# 11.4 Run continuous sensitivity and save plots
 # ------------------------------------------------------------
 
 for (fig_id in names(continuous_plan)) {
   
   message("Running ", fig_id, ": ", continuous_plan[[fig_id]]$label)
   
-  res <- continuous_sensitivity(
+  res <- continuous_reassignment_sensitivity(
     sf               = county_ny_continuous,
     field_rules      = field_rules,
     summary_field    = "pop_tol",
@@ -538,6 +644,8 @@ for (fig_id in names(continuous_plan)) {
     max_iter         = 1000,
     tol_ratio        = 0.1,
     random_seed      = 123,
+    parallel         = use_parallel,
+    n_workers        = parallel_workers,
     save_path        = file.path(rds_dir, paste0(fig_id, ".rds"))
   )
   
@@ -554,12 +662,13 @@ for (fig_id in names(continuous_plan)) {
 
 
 # ============================================================
-# 11. Discrete sensitivity
-# Moran's I of county population in the NY county-subdivision hierarchy
+# 12. Discrete sensitivity
+# Manuscript Example set V: discrete reassignment sensitivity of Moran's I
+# of county population in the NY county-subdivision hierarchy
 # ============================================================
 
 # ------------------------------------------------------------
-# 11.1 Prepare New York county layer as coarser_sf
+# 12.1 Prepare New York county layer as coarser_sf
 # ------------------------------------------------------------
 
 county_ny_discrete <- county %>%
@@ -580,7 +689,7 @@ county_id_lookup <- county_ny_discrete %>%
 
 
 # ------------------------------------------------------------
-# 11.2 Prepare county subdivision population attributes from S0101
+# 12.2 Prepare county subdivision population attributes from S0101
 # ------------------------------------------------------------
 
 subcounty_attr_s0101 <- s0101_raw %>%
@@ -595,7 +704,7 @@ subcounty_attr_s0101 <- s0101_raw %>%
 
 
 # ------------------------------------------------------------
-# 11.3 Prepare New York county subdivision layer as finer_sf
+# 12.3 Prepare New York county subdivision layer as finer_sf
 # ------------------------------------------------------------
 
 subcounty_ny_discrete <- subcounty %>%
@@ -619,7 +728,7 @@ message("Number of NY county subdivisions: ", nrow(subcounty_ny_discrete))
 
 
 # ------------------------------------------------------------
-# 11.4 Define field rules for discrete reassignment
+# 12.4 Define field rules for discrete reassignment
 # ------------------------------------------------------------
 
 # pop_tol is an extensive variable.
@@ -632,7 +741,7 @@ field_rules_discrete <- list(
 
 
 # ------------------------------------------------------------
-# 11.5 Define Moran's I summary function
+# 12.5 Define Moran's I summary function
 # ------------------------------------------------------------
 
 # Construct rook contiguity weights for the original NY county layer.
@@ -647,6 +756,8 @@ county_lw <- nb2listw(
 )
 
 summary_moran <- function(x) {
+  # Compute Moran's I for the county-level population vector using the fixed
+  # neighborhood weights defined above.
   moran.test(
     x,
     listw       = county_lw,
@@ -657,7 +768,7 @@ summary_moran <- function(x) {
 
 
 # ------------------------------------------------------------
-# 11.6 Calculate area budget
+# 12.6 Calculate area budget
 # ------------------------------------------------------------
 
 county_area_m2 <- as.numeric(st_area(county_ny_discrete))
@@ -677,10 +788,10 @@ discrete_alpha <- 1.0 * avg_county_area_m2
 
 
 # ------------------------------------------------------------
-# 11.7 Discrete sensitivity by reassigned area
+# 12.7 Discrete sensitivity by reassigned area
 # ------------------------------------------------------------
 
-res_discrete_area <- discrete_area_sensitivity(
+res_discrete_area <- discrete_reassignment_sensitivity_area(
   finer_sf         = subcounty_ny_discrete,
   coarser_sf       = county_ny_discrete,
   field_rules      = field_rules_discrete,
@@ -688,6 +799,9 @@ res_discrete_area <- discrete_area_sensitivity(
   alpha            = discrete_alpha,
   summary_field    = "pop_tol",
   summary_function = summary_moran,
+  random_seed      = 123,
+  parallel         = use_parallel,
+  n_workers        = parallel_workers,
   tol_ratio        = 0.1,
   keep_maps        = FALSE,
   save_path        = file.path(rds_dir, "fig_discrete_area.rds")
@@ -700,10 +814,10 @@ plot_and_save(
 
 
 # ------------------------------------------------------------
-# 11.8 Discrete sensitivity by number of reassigned fine regions
+# 12.8 Discrete sensitivity by number of reassigned fine regions
 # ------------------------------------------------------------
 
-res_discrete_region <- discrete_region_sensitivity(
+res_discrete_region <- discrete_reassignment_sensitivity_regions(
   finer_sf         = subcounty_ny_discrete,
   coarser_sf       = county_ny_discrete,
   field_rules      = field_rules_discrete,
@@ -711,6 +825,9 @@ res_discrete_region <- discrete_region_sensitivity(
   n_iterations     = 100,
   summary_function = summary_moran,
   summary_field    = "pop_tol",
+  random_seed      = 123,
+  parallel         = use_parallel,
+  n_workers        = parallel_workers,
   save_path        = file.path(rds_dir, "fig_discrete_region.rds")
 )
 
@@ -718,3 +835,6 @@ plot_and_save(
   result_obj      = res_discrete_region,
   filename_prefix = file.path(fig_dir, "fig_discrete_region")
 )
+
+
+
