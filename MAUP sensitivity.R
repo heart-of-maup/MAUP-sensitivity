@@ -1,7 +1,7 @@
 # On the sensitivities to the modifiable areal unit problem
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-04-30
+# 2026-06-16
 
 library(geojsonio)
 library(readxl)
@@ -11,7 +11,163 @@ library(lwgeom)
 library(ggplot2)
 library(spdep)
 
+validate_summary_fields <- function(sf, summary_field, object_name = "sf") {
+  # Validate that the requested summary field(s) exist and are numeric.
+  # The returned field vector is safe to pass into summary functions.
+  
+  if (missing(summary_field) || is.null(summary_field)) {
+    stop("summary_field must be provided")
+  }
+  
+  # Coerce to character so both bare names and character vectors are handled
+  # consistently by the checks below.
+  summary_field <- as.character(summary_field)
+  
+  # Reject empty, missing, or blank field names before looking them up.
+  if (length(summary_field) < 1L || any(is.na(summary_field)) || any(!nzchar(summary_field))) {
+    stop("summary_field must contain at least one valid field name")
+  }
+  
+  # Check that every requested field is present in the supplied data object.
+  missing_fields <- setdiff(summary_field, names(sf))
+  if (length(missing_fields) > 0L) {
+    stop(sprintf(
+      "Field(s) %s do not exist in %s",
+      paste(sprintf("'%s'", missing_fields), collapse = ", "),
+      object_name
+    ))
+  }
+  
+  # Sensitivity statistics are computed from numeric vectors only.
+  non_numeric_fields <- summary_field[!vapply(
+    summary_field,
+    function(field_name) is.numeric(sf[[field_name]]),
+    logical(1)
+  )]
+  if (length(non_numeric_fields) > 0L) {
+    stop(sprintf(
+      "Field(s) %s must be numeric",
+      paste(sprintf("'%s'", non_numeric_fields), collapse = ", ")
+    ))
+  }
+  
+  summary_field
+}
+
+call_summary_function <- function(sf, summary_field, summary_function) {
+  # Extract one or more fields from an sf object and pass them to the selected
+  # summary function as ordinary vectors.
+  
+  args <- lapply(summary_field, function(field_name) sf[[field_name]])
+  do.call(summary_function, unname(args))
+}
+
+default_parallel_workers <- function(reserve_cores = 1L) {
+  # Choose a conservative number of parallel workers while leaving cores free
+  # for the operating system and other tasks.
+  
+  n_cores <- parallel::detectCores(logical = TRUE)
+  
+  if (is.na(n_cores) || n_cores < 2L) {
+    return(1L)
+  }
+  
+  max(1L, n_cores - reserve_cores)
+}
+
+run_monte_carlo <- function(X,
+                            FUN,
+                            parallel  = FALSE,
+                            n_workers = default_parallel_workers(),
+                            random_seed = NULL,
+                            export_names = character(0),
+                            export_env = .GlobalEnv,
+                            progress_label = "Monte Carlo") {
+  # Run a Monte-Carlo job either serially or with a temporary PSOCK cluster.
+  # This wrapper keeps random seeding and worker setup consistent.
+  
+  if (!isTRUE(parallel)) {
+    return(lapply(X, FUN))
+  }
+  
+  n_workers <- as.integer(n_workers)
+  n_workers <- max(1L, min(n_workers, length(X)))
+  
+  if (n_workers <= 1L || length(X) <= 1L) {
+    return(lapply(X, FUN))
+  }
+  
+  message(sprintf(
+    "%s: using %d parallel workers for %d iterations",
+    progress_label, n_workers, length(X)
+  ))
+  
+  cl <- parallel::makeCluster(n_workers)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  
+  if (!is.null(random_seed)) {
+    parallel::clusterSetRNGStream(cl, random_seed)
+  }
+  
+  parallel::clusterEvalQ(cl, {
+    for (pkg in c("sf", "lwgeom", "spdep")) {
+      if (requireNamespace(pkg, quietly = TRUE)) {
+        suppressPackageStartupMessages(
+          library(pkg, character.only = TRUE)
+        )
+      }
+    }
+    NULL
+  })
+  
+  export_names <- unique(as.character(export_names))
+  export_names <- export_names[nzchar(export_names)]
+  if (length(export_names) > 0L) {
+    parallel::clusterExport(cl, export_names, envir = export_env)
+  }
+  
+  # Run parallel jobs in batches so the main process can report progress
+  # instead of staying silent until every worker finishes.
+  batch_size <- max(n_workers, ceiling(length(X) / 10))
+  batch_ids <- split(seq_along(X), ceiling(seq_along(X) / batch_size))
+  results <- vector("list", length(X))
+  
+  for (batch in batch_ids) {
+    batch_results <- parallel::parLapply(cl, X[batch], FUN)
+    results[batch] <- batch_results
+    
+    n_done <- max(batch)
+    message(sprintf(
+      "%s: completed %d/%d iterations",
+      progress_label, n_done, length(X)
+    ))
+  }
+  
+  results
+}
+
+summary_function_export_names <- function(summary_function) {
+  # Identify external variables used inside a user-supplied summary function
+  # so PSOCK workers can see objects such as spatial weights.
+  
+  if (!is.function(summary_function) ||
+      !requireNamespace("codetools", quietly = TRUE)) {
+    return(character(0))
+  }
+  
+  globals <- codetools::findGlobals(summary_function, merge = FALSE)
+  variables <- globals$variables
+  if (is.null(variables)) {
+    return(character(0))
+  }
+  
+  variables <- unique(as.character(variables))
+  variables[nzchar(variables)]
+}
+
 merging_operation <- function(sf, i, j, field_rules) {
+  # Merge two areal units and recalculate their attributes according to
+  # the user-supplied field rules.
   
   # ── Locate target row indices ─────────────────────────────────────────────
   idx_i <- which(sf$ID == i)
@@ -76,6 +232,112 @@ merging_operation <- function(sf, i, j, field_rules) {
   rbind(sf[-c(idx_i, idx_j), ], new_row)
 }
 
+calculate_merge_complexity <- function(sf_object, n_simulations = 1000) {
+  # Estimate the number of possible k-step merge paths using Monte-Carlo
+  # simulations on the rook-contiguity graph of the input sf object.
+  
+  # ---- Build the initial topology graph -------------------------------
+  message("Building topology graph...")
+  nb <- spdep::poly2nb(sf_object, queen = FALSE)
+  
+  if (any(spdep::card(nb) == 0)) {
+    warning("Some isolated regions cannot be merged.")
+  }
+  
+  adj_mat <- spdep::nb2mat(nb, style = "B", zero.policy = TRUE)
+  g_initial <- igraph::graph_from_adjacency_matrix(
+    adj_mat,
+    mode = "undirected"
+  )
+  g_initial <- igraph::simplify(
+    g_initial,
+    remove.multiple = TRUE,
+    remove.loops = TRUE
+  )
+  
+  max_k <- igraph::vcount(g_initial) - 1L
+  if (max_k < 1L) {
+    return(data.frame(
+      k_order = integer(),
+      avg_available_merges = numeric(),
+      estimated_total_combinations_log10 = numeric(),
+      estimated_total_combinations = numeric()
+    ))
+  }
+  
+  available_choices_matrix <- matrix(
+    NA_real_,
+    nrow = n_simulations,
+    ncol = max_k
+  )
+  
+  message(sprintf(
+    "Starting %d topology merge simulations...",
+    n_simulations
+  ))
+  
+  # ---- Monte-Carlo topology merge simulations -------------------------
+  for (sim in seq_len(n_simulations)) {
+    g_current <- g_initial
+    
+    for (k in seq_len(max_k)) {
+      n_edges <- igraph::ecount(g_current)
+      available_choices_matrix[sim, k] <- n_edges
+      
+      if (n_edges == 0L) break
+      
+      # Randomly choose one adjacent pair to merge.
+      edge_idx  <- sample.int(n_edges, 1L)
+      edge_ends <- igraph::ends(g_current, edge_idx, names = FALSE)
+      v1 <- edge_ends[1]
+      v2 <- edge_ends[2]
+      
+      # Contract v2 into v1 by reconnecting v2's neighbors to v1.
+      neighbors_v2 <- igraph::neighbors(g_current, v2)
+      neighbors_v2 <- neighbors_v2[neighbors_v2 != v1]
+      
+      if (length(neighbors_v2) > 0L) {
+        new_edges <- as.vector(
+          rbind(rep(v1, length(neighbors_v2)), neighbors_v2)
+        )
+        g_current <- igraph::add_edges(g_current, new_edges)
+      }
+      
+      # Remove v2 and simplify the topology graph.
+      g_current <- igraph::delete_vertices(g_current, v2)
+      g_current <- igraph::simplify(
+        g_current,
+        remove.multiple = TRUE,
+        remove.loops = TRUE
+      )
+    }
+    
+    if (sim %% 100L == 0L) {
+      message(sprintf(
+        "Completed simulations: %d/%d",
+        sim,
+        n_simulations
+      ))
+    }
+  }
+  
+  # ---- Summarize simulated branching factors --------------------------
+  message("Calculating complexity summary...")
+  
+  avg_choices <- colMeans(available_choices_matrix, na.rm = TRUE)
+  avg_choices[!is.finite(avg_choices)] <- 0
+  
+  log10_choices <- ifelse(avg_choices > 0, log10(avg_choices), -Inf)
+  log10_cumulative <- cumsum(log10_choices)
+  
+  data.frame(
+    k_order = seq_len(max_k),
+    avg_available_merges = round(avg_choices, 2),
+    estimated_total_combinations_log10 = round(log10_cumulative, 2),
+    estimated_total_combinations = 10^log10_cumulative
+  )
+}
+
 merging_sensitivity <- function(sf,
                                 field_rules,
                                 summary_field,
@@ -85,19 +347,22 @@ merging_sensitivity <- function(sf,
                                 n_iterations         = 100,
                                 random_seed          = NULL,
                                 n_simulations        = 200,
+                                parallel             = FALSE,
+                                n_workers            = default_parallel_workers(),
                                 save_path            = NULL) {
+  # Estimate how much a summary statistic changes after k sequential merges.
+  # Small candidate spaces are enumerated; larger ones are sampled randomly.
   
   # ── Input validation ──────────────────────────────────────────────────────
   if (!is.function(summary_function))         stop("summary_function must be a function")
-  if (!summary_field %in% colnames(sf))       stop(paste0("Field '", summary_field, "' does not exist in the sf object"))
-  if (!is.numeric(sf[[summary_field]]))       stop(paste0("Field '", summary_field, "' must be numeric"))
+  summary_field <- validate_summary_fields(sf, summary_field)
   if (k_order < 1)                            stop("k_order must be >= 1")
   
   if (!is.null(random_seed)) set.seed(random_seed)
   
   # ── Compute baseline statistic ────────────────────────────────────────────
   origin_value <- tryCatch({
-    summary_function(sf[[summary_field]])
+    call_summary_function(sf, summary_field, summary_function)
   }, error = function(e) {
     stop(paste0("summary_function failed on the initial data: ", e$message))
   })
@@ -115,6 +380,7 @@ merging_sensitivity <- function(sf,
   
   # ── Exhaustively enumerate all possible k-step merge paths ────────────────
   exhaustive_merging <- function() {
+    # Enumerate every valid k-step merge path and store each step's statistic.
     
     message(sprintf("Starting exhaustive enumeration of all %d-order merge paths...", k_order))
     
@@ -131,6 +397,8 @@ merging_sensitivity <- function(sf,
     path_counter <- 0L
     
     explore_merge_paths <- function(current_sf, current_k, path_history) {
+      # Recursively extend one partial merge path until the requested order is
+      # reached or no adjacent merge candidates remain.
       
       if (current_k > k_order) {
         # Target order reached; record the complete path
@@ -180,7 +448,7 @@ merging_sensitivity <- function(sf,
           new_id <- max(temp_sf$ID, na.rm = TRUE)
           
           current_value <- tryCatch({
-            summary_function(temp_sf[[summary_field]])
+            call_summary_function(temp_sf, summary_field, summary_function)
           }, error = function(e) {
             warning(paste0("summary_function failed (path ", path_counter + 1L,
                            ", k=", current_k, "): ", e$message))
@@ -209,25 +477,23 @@ merging_sensitivity <- function(sf,
   
   # ── Randomly sample n_iterations k-step merge paths ───────────────────────
   random_merging <- function() {
+    # Sample k-step merge paths when exhaustive enumeration is too expensive.
     
     message(sprintf("Starting random sampling of %d-order merging, %d iterations...", k_order, n_iterations))
     
-    results <- data.frame(
-      path_id = integer(),
-      k       = integer(),
-      i       = character(),
-      j       = character(),
-      new     = integer(),
-      value   = numeric(),
-      stringsAsFactors = FALSE
-    )
+    sf_local               <- sf
+    field_rules_local      <- field_rules
+    summary_field_local    <- summary_field
+    summary_function_local <- summary_function
+    merge_op               <- get("merging_operation", mode = "function", inherits = TRUE)
+    call_summary_fn        <- get("call_summary_function", mode = "function", inherits = TRUE)
     
-    skipped <- 0L
-    
-    for (iter in seq_len(n_iterations)) {
-      temp_sf    <- sf
-      iter_rows  <- vector("list", k_order)
-      iter_valid <- TRUE
+    run_one_merge_path <- function(iter) {
+      # Run one independent random merge path and return its step log.
+      temp_sf       <- sf_local
+      iter_rows     <- vector("list", k_order)
+      iter_valid    <- TRUE
+      attempt_error <- NULL
       
       for (merge_level in seq_len(k_order)) {
         
@@ -235,7 +501,6 @@ merging_sensitivity <- function(sf,
         candidates <- which(sapply(G, length) > 0)
         
         if (length(candidates) == 0) {
-          warning(sprintf("Iteration %d has no mergeable regions at step %d; discarding", iter, merge_level))
           iter_valid <- FALSE
           break
         }
@@ -247,10 +512,12 @@ merging_sensitivity <- function(sf,
         id_j    <- temp_sf$ID[j_index]
         
         temp_sf <- tryCatch(
-          merging_operation(temp_sf, id_i, id_j, field_rules),
+          merge_op(temp_sf, id_i, id_j, field_rules_local),
           error = function(e) {
-            warning(sprintf("Iteration %d step %d merge failed; discarding this iteration: %s",
-                            iter, merge_level, e$message))
+            attempt_error <<- sprintf(
+              "merge failed at iteration %d, k=%d, IDs=%s/%s: %s",
+              iter, merge_level, id_i, id_j, e$message
+            )
             NULL
           }
         )
@@ -263,10 +530,10 @@ merging_sensitivity <- function(sf,
         new_id <- max(temp_sf$ID, na.rm = TRUE)
         
         current_value <- tryCatch({
-          summary_function(temp_sf[[summary_field]])
+          call_summary_fn(temp_sf, summary_field_local, summary_function_local)
         }, error = function(e) {
-          warning(paste0("summary_function failed (iteration ", iter,
-                         ", k=", merge_level, "): ", e$message))
+          attempt_error <<- paste0("summary_function failed (iteration ", iter,
+                                   ", k=", merge_level, "): ", e$message)
           NA
         })
         
@@ -281,18 +548,57 @@ merging_sensitivity <- function(sf,
         )
       }
       
-      if (iter_valid) {
-        results <- rbind(results, do.call(rbind, iter_rows))
-      } else {
-        skipped <- skipped + 1L
+      if (!iter_valid) {
+        if (is.null(attempt_error)) {
+          attempt_error <- sprintf(
+            "no mergeable candidates at iteration %d before reaching k=%d",
+            iter, k_order
+          )
+        }
+        return(list(error = attempt_error))
       }
-      
-      if (iter %% 10 == 0) {
-        message(sprintf("Completed %d/%d iterations (%d discarded)", iter, n_iterations, skipped))
-      }
+      do.call(rbind, iter_rows)
+    }
+    
+    iter_results <- run_monte_carlo(
+      X              = seq_len(n_iterations),
+      FUN            = run_one_merge_path,
+      parallel       = parallel,
+      n_workers      = n_workers,
+      random_seed    = random_seed,
+      export_names   = summary_function_export_names(summary_function),
+      export_env     = environment(summary_function),
+      progress_label = "Merging sensitivity"
+    )
+    
+    error_messages <- vapply(
+      Filter(function(x) is.list(x) && !is.null(x$error), iter_results),
+      function(x) x$error,
+      character(1)
+    )
+    valid_results <- Filter(is.data.frame, iter_results)
+    skipped       <- n_iterations - length(valid_results)
+    results       <- if (length(valid_results) > 0L) {
+      do.call(rbind, valid_results)
+    } else {
+      data.frame(
+        path_id = integer(),
+        k       = integer(),
+        i       = character(),
+        j       = character(),
+        new     = integer(),
+        value   = numeric(),
+        stringsAsFactors = FALSE
+      )
     }
     
     message(sprintf("Random sampling finished: %d successful, %d discarded", n_iterations - skipped, skipped))
+    if (length(error_messages) > 0L) {
+      warning(sprintf(
+        "First merging failure messages:\n%s",
+        paste(utils::head(unique(error_messages), 5L), collapse = "\n")
+      ))
+    }
     return(results)
   }
   
@@ -340,12 +646,47 @@ merging_sensitivity <- function(sf,
   return(result)
 }
 
+generate_smooth_guided_path <- function(start, end) {
+  # Create a random smooth polyline between two boundary points.
+  # The line is used as a stochastic cutting path for polygon splitting.
+  
+  # Number of intermediate steps follows a Poisson distribution
+  n_steps <- rpois(1, lambda = 10)
+  
+  # Direction vector and its length from start to end
+  direction <- end - start
+  total_d <- sqrt(sum(direction^2))
+  direction_unit <- direction / total_d
+  
+  # Perpendicular unit vector, used to add lateral offsets
+  perp <- c(-direction_unit[2], direction_unit[1])
+  
+  # Sample positions along the segment (in [0, 1]) and sort them
+  t_vec <- sort(c(0, runif(n_steps), 1))
+  
+  # Maximum allowed offset at each position; tapers to 0 at the two endpoints
+  # so the path remains anchored at start and end
+  r_max_vec <- total_d * pmin(t_vec, 1 - t_vec)
+  r_vec <- runif(length(t_vec), min = -r_max_vec, max = r_max_vec)
+  
+  # Base points along the straight line plus the lateral offsets
+  base_points <- matrix(start, nrow = length(t_vec), ncol = 2, byrow = TRUE) + 
+    t_vec %*% t(direction)
+  offsets <- r_vec %*% t(perp)
+  path <- base_points + offsets
+  return(path)
+}
+
 splitting_operation <- function(
     sf,
     target_id,
     field_rules = NULL,
     max_iter    = 100
 ) {
+  # Split one selected areal unit into two parts and allocate attributes to
+  # the new parts according to the supplied field rules.
+  
+  # ---- Input validation and target lookup -----------------------------
   if (!inherits(sf, "sf"))       stop("Input must be an sf object")
   if (!target_id %in% sf$ID)     stop(paste0("Target ID does not exist: ", target_id))
   
@@ -355,6 +696,7 @@ splitting_operation <- function(
   attempts <- 0
   parts    <- NULL
   
+  # ---- Generate a valid two-part split -------------------------------
   while (is.null(parts) || length(parts) != 2) {
     attempts <- attempts + 1
     if (attempts > max_iter) {
@@ -383,11 +725,13 @@ splitting_operation <- function(
     }, error = function(e) NULL)
   }
   
+  # ---- Compute area shares for attribute allocation -------------------
   # Compute area ratios, used by the area_weighted rule
   areas      <- st_area(parts)
   ratios     <- as.numeric(areas / sum(areas))
   base_attrs <- sf[target_index, , drop = FALSE] |> st_drop_geometry()
   
+  # ---- Build the two new rows and update their attributes -------------
   new_parts <- lapply(1:2, function(i) {
     attrs <- base_attrs
     
@@ -442,6 +786,7 @@ splitting_operation <- function(
     st_as_sf(cbind(attrs, geometry = parts[i]))
   })
   
+  # ---- Assign IDs and rebuild the sf object ---------------------------
   # Assign new IDs; this matches the setdiff(after$ID, before$ID) tracking
   # logic used in splitting_sensitivity
   new_ids           <- max(sf$ID, na.rm = TRUE) + 1:2
@@ -459,12 +804,15 @@ splitting_sensitivity <- function(sf,
                                   k_order      = 1,
                                   n_iterations = 100,
                                   random_seed  = NULL,
+                                  parallel     = FALSE,
+                                  n_workers    = default_parallel_workers(),
                                   save_path    = NULL) {
+  # Estimate how much a summary statistic changes after k sequential splits.
+  # Split paths are sampled randomly because the search space is very large.
   
   # ── Input validation ──────────────────────────────────────────────────────
   if (!is.function(summary_function))   stop("summary_function must be a function")
-  if (!summary_field %in% colnames(sf)) stop(paste0("Field '", summary_field, "' does not exist in the sf object"))
-  if (!is.numeric(sf[[summary_field]])) stop(paste0("Field '", summary_field, "' must be numeric"))
+  summary_field <- validate_summary_fields(sf, summary_field)
   if (k_order < 1)                      stop("k_order must be >= 1")
   
   if (!is.null(random_seed)) set.seed(random_seed)
@@ -473,7 +821,7 @@ splitting_sensitivity <- function(sf,
   # Record the statistic on the original data as a reference baseline before
   # any split operation is performed
   origin_value <- tryCatch({
-    summary_function(sf[[summary_field]])
+    call_summary_function(sf, summary_field, summary_function)
   }, error = function(e) {
     stop(paste0("summary_function failed on the initial data: ", e$message))
   })
@@ -499,10 +847,143 @@ splitting_sensitivity <- function(sf,
   
   successful   <- 0L
   attempts     <- 0L
+  error_messages <- character(0)
   # Cap the total number of attempts to prevent infinite loops when split
   # conditions are very restrictive
   max_attempts <- max(n_iterations * 10L, n_iterations + 1000L)
   
+  if (isTRUE(parallel)) {
+    field_rules_local <- field_rules
+    summary_field_local <- summary_field
+    summary_function_local <- summary_function
+    guided_path_fn <- get("generate_smooth_guided_path", mode = "function", inherits = TRUE)
+    split_op <- get("splitting_operation", mode = "function", inherits = TRUE)
+    call_summary_fn <- get("call_summary_function", mode = "function", inherits = TRUE)
+    
+    # Make the splitter self-contained for PSOCK workers. Its body calls
+    # generate_smooth_guided_path(), so bind that name in the splitter's
+    # enclosing environment before parLapply serializes the closure.
+    generate_smooth_guided_path <- guided_path_fn
+    environment(split_op) <- environment()
+    
+    run_one_split_attempt <- function(attempt_id) {
+      # Try to generate one successful k-step split path from the original sf.
+      temp_sf    <- sf
+      iter_rows  <- vector("list", k_order)
+      iter_valid <- TRUE
+      attempt_error <- NULL
+      
+      for (split_level in seq_len(k_order)) {
+        if (nrow(temp_sf) == 0) {
+          iter_valid <- FALSE
+          attempt_error <- "temporary sf became empty"
+          break
+        }
+        
+        i_index    <- sample(seq_len(nrow(temp_sf)), 1)
+        id_i       <- temp_sf$ID[i_index]
+        ids_before <- temp_sf$ID
+        
+        temp_sf <- tryCatch(
+          split_op(temp_sf, id_i, field_rules_local),
+          error = function(e) {
+            attempt_error <<- paste0(
+              "split failed at attempt ", attempt_id,
+              ", k=", split_level,
+              ", ID=", id_i,
+              ": ", e$message
+            )
+            NULL
+          }
+        )
+        
+        if (is.null(temp_sf)) {
+          iter_valid <- FALSE
+          break
+        }
+        
+        new_ids <- sort(setdiff(temp_sf$ID, ids_before))
+        new1    <- if (length(new_ids) >= 1) new_ids[1] else NA_integer_
+        new2    <- if (length(new_ids) >= 2) new_ids[2] else NA_integer_
+        
+        current_value <- tryCatch({
+          call_summary_fn(temp_sf, summary_field_local, summary_function_local)
+        }, error = function(e) {
+          attempt_error <<- paste0(
+            "summary_function failed at attempt ", attempt_id,
+            ", k=", split_level,
+            ": ", e$message
+          )
+          NA
+        })
+        
+        iter_rows[[split_level]] <- data.frame(
+          path_id = attempt_id,
+          k       = split_level,
+          i       = as.character(id_i),
+          new1    = new1,
+          new2    = new2,
+          value   = current_value,
+          stringsAsFactors = FALSE
+        )
+      }
+      
+      if (!iter_valid) {
+        if (is.null(attempt_error)) attempt_error <- "unknown split failure"
+        return(list(error = attempt_error))
+      }
+      do.call(rbind, iter_rows)
+    }
+    
+    valid_results <- list()
+    
+    while (successful < n_iterations && attempts < max_attempts) {
+      remaining_successes <- n_iterations - successful
+      batch_size <- min(
+        max(remaining_successes * 2L, n_workers),
+        max_attempts - attempts
+      )
+      batch_ids <- attempts + seq_len(batch_size)
+      batch_seed <- if (is.null(random_seed)) NULL else random_seed + attempts
+      
+      attempt_results <- run_monte_carlo(
+        X              = batch_ids,
+        FUN            = run_one_split_attempt,
+        parallel       = TRUE,
+        n_workers      = n_workers,
+        random_seed    = batch_seed,
+        export_names   = summary_function_export_names(summary_function),
+        export_env     = environment(summary_function),
+        progress_label = "Splitting sensitivity"
+      )
+      
+      batch_errors <- vapply(
+        Filter(function(x) is.list(x) && !is.null(x$error), attempt_results),
+        function(x) x$error,
+        character(1)
+      )
+      if (length(batch_errors) > 0L) {
+        error_messages <- c(error_messages, batch_errors)
+      }
+      
+      batch_valid <- Filter(is.data.frame, attempt_results)
+      if (length(batch_valid) > 0L) {
+        valid_results <- c(valid_results, batch_valid)
+      }
+      
+      attempts   <- attempts + batch_size
+      successful <- min(length(valid_results), n_iterations)
+    }
+    
+    if (successful > 0L) {
+      selected <- valid_results[seq_len(successful)]
+      selected <- Map(function(df, path_id) {
+        df$path_id <- path_id
+        df
+      }, selected, seq_len(successful))
+      results <- do.call(rbind, selected)
+    }
+  } else {
   while (successful < n_iterations && attempts < max_attempts) {
     attempts   <- attempts + 1L
     temp_sf    <- sf          # restart from the original data each path
@@ -542,7 +1023,7 @@ splitting_sensitivity <- function(sf,
       # Compute the statistic after this step; on failure, record NA and
       # continue rather than aborting the whole path
       current_value <- tryCatch({
-        summary_function(temp_sf[[summary_field]])
+        call_summary_function(temp_sf, summary_field, summary_function)
       }, error = function(e) {
         warning(paste0("summary_function failed (attempt ", attempts,
                        ", k=", split_level, "): ", e$message))
@@ -571,6 +1052,7 @@ splitting_sensitivity <- function(sf,
       }
     }
   }
+  }
   
   # If the attempt cap is reached without meeting the target, raise a clear
   # warning rather than silently returning a deficient result
@@ -579,6 +1061,13 @@ splitting_sensitivity <- function(sf,
       "Reached the maximum attempt cap (%d); only %d/%d paths succeeded. Consider relaxing the split conditions or lowering k_order",
       max_attempts, successful, n_iterations
     ))
+    
+    if (length(error_messages) > 0L) {
+      warning(sprintf(
+        "First splitting failure messages:\n%s",
+        paste(utils::head(unique(error_messages), 5L), collapse = "\n")
+      ))
+    }
   }
   
   message(sprintf("Random sampling finished: %d successes, %d total attempts",
@@ -615,34 +1104,6 @@ splitting_sensitivity <- function(sf,
   return(result)
 }
 
-generate_smooth_guided_path <- function(start, end) {
-  # Number of intermediate steps follows a Poisson distribution
-  n_steps <- rpois(1, lambda = 10)
-  
-  # Direction vector and its length from start to end
-  direction <- end - start
-  total_d <- sqrt(sum(direction^2))
-  direction_unit <- direction / total_d
-  
-  # Perpendicular unit vector, used to add lateral offsets
-  perp <- c(-direction_unit[2], direction_unit[1])
-  
-  # Sample positions along the segment (in [0, 1]) and sort them
-  t_vec <- sort(c(0, runif(n_steps), 1))
-  
-  # Maximum allowed offset at each position; tapers to 0 at the two endpoints
-  # so the path remains anchored at start and end
-  r_max_vec <- total_d * pmin(t_vec, 1 - t_vec)
-  r_vec <- runif(length(t_vec), min = -r_max_vec, max = r_max_vec)
-  
-  # Base points along the straight line plus the lateral offsets
-  base_points <- matrix(start, nrow = length(t_vec), ncol = 2, byrow = TRUE) + 
-    t_vec %*% t(direction)
-  offsets <- r_vec %*% t(perp)
-  path <- base_points + offsets
-  return(path)
-}
-
 continuous_reassignment_operation <- function(
     sf,
     alpha,
@@ -652,10 +1113,12 @@ continuous_reassignment_operation <- function(
     max_iter  = 1000,
     tol_ratio = 0.1
 ) {
+  # Reassign a continuous amount of area by splitting a source region and
+  # merging one split part into a neighboring target region.
+  
   # ── Input validation ────────────────────────────────────────────────────
   if (!inherits(sf, "sf"))              stop("Input must be an sf object")
-  if (!summary_field %in% names(sf))    stop(sprintf("Field '%s' does not exist", summary_field))
-  if (!is.numeric(sf[[summary_field]])) stop("summary_field must be numeric")
+  summary_field <- validate_summary_fields(sf, summary_field)
   if (!is.function(summary_function))   stop("summary_function must be a function")
   
   # ── Initialize state variables ──────────────────────────────────────────
@@ -670,7 +1133,7 @@ continuous_reassignment_operation <- function(
   
   # ── Compute baseline summary statistic ──────────────────────────────────
   stat_before <- tryCatch(
-    summary_function(sf[[summary_field]]),
+    call_summary_function(sf, summary_field, summary_function),
     error = function(e) stop(paste0("summary_function failed: ", e$message))
   )
   current_stat       <- stat_before
@@ -686,7 +1149,7 @@ continuous_reassignment_operation <- function(
     
     total_iter <- total_iter + 1L
     
-    # -- Pick a source polygon from the unblocked candidate pool --------
+    # ---- Pick a source polygon from the unblocked candidate pool ------
     candidates <- setdiff(current_sf$ID, source_blocked)
     if (length(candidates) == 0L) {
       termination_reason <- "candidate set is empty"
@@ -696,7 +1159,7 @@ continuous_reassignment_operation <- function(
     source_id  <- sample(candidates, 1)
     source_row <- which(current_sf$ID == source_id)
     
-    # -- Identify topological neighbors of the source -------------------
+    # ---- Identify topological neighbors of the source -----------------
     # Only direct neighbors (sharing a boundary) are valid merge targets;
     # this preserves spatial contiguity in the resulting zoning.
     pre_neighbor_idx <- st_touches(
@@ -711,7 +1174,7 @@ continuous_reassignment_operation <- function(
       next
     }
     
-    # -- Split the source polygon into sub-parts ------------------------
+    # ---- Split the source polygon into sub-parts ----------------------
     split_result <- tryCatch(
       splitting_operation(current_sf, source_id, field_rules),
       error = function(e) NULL
@@ -732,7 +1195,7 @@ continuous_reassignment_operation <- function(
     # produced by the splitter (which would bias the area distribution).
     try_order <- sample(seq_len(nrow(new_geoms)))
     
-    # -- Try to merge one sub-part into a neighboring polygon -----------
+    # ---- Try to merge one sub-part into a neighboring polygon ---------
     success <- FALSE
     for (i in try_order) {
       part_to_merge <- new_geoms[i, ]
@@ -759,11 +1222,11 @@ continuous_reassignment_operation <- function(
       
       # Recompute the summary statistic on the updated sf.
       new_stat <- tryCatch(
-        summary_function(merged_result[[summary_field]]),
+        call_summary_function(merged_result, summary_field, summary_function),
         error = function(e) NA_real_
       )
       
-      # -- Log this successful step -----------------------------------
+      # ---- Log this successful step ----------------------------------
       step_count <- step_count + 1L
       step_log_list[[step_count]] <- data.frame(
         step        = step_count,
@@ -776,14 +1239,14 @@ continuous_reassignment_operation <- function(
         stringsAsFactors = FALSE
       )
       
-      # -- Update state for the next iteration ------------------------
+      # ---- Update state for the next iteration -----------------------
+      new_merged_id   <- max(merged_result$ID, na.rm = TRUE)
       current_stat    <- new_stat
       remaining_alpha <- remaining_alpha - part_area
-      # Block the target so it cannot be picked as a source in the next
-      # iteration. Without this guard the algorithm could immediately
-      # split off the same area it just merged in, producing a no-op
-      # cycle and wasting iterations.
-      source_blocked  <- union(source_blocked, target_id)
+      # Block the newly merged unit so it cannot be picked as a source in
+      # the next iteration. The old target_id no longer exists after
+      # merging_operation(), which replaces both input rows with a new ID.
+      source_blocked  <- union(source_blocked, new_merged_id)
       current_sf      <- merged_result
       success         <- TRUE
       break
@@ -801,7 +1264,7 @@ continuous_reassignment_operation <- function(
   # ── Final statistics on the resulting sf ────────────────────────────────
   converged  <- abs(remaining_alpha) <= tol
   stat_after <- tryCatch(
-    summary_function(current_sf[[summary_field]]),
+    call_summary_function(current_sf, summary_field, summary_function),
     error = function(e) NA_real_
   )
   
@@ -834,8 +1297,7 @@ continuous_reassignment_operation <- function(
   ))
 }
 
-
-continuous_sensitivity <- function(
+continuous_reassignment_sensitivity <- function(
     sf,
     field_rules,
     summary_field,
@@ -845,17 +1307,35 @@ continuous_sensitivity <- function(
     max_iter     = 1000,
     tol_ratio    = 0.1,
     random_seed  = NULL,
+    parallel     = FALSE,
+    n_workers    = default_parallel_workers(),
     save_path    = NULL
 ) {
+  # Run repeated continuous reassignment simulations and summarize the
+  # resulting distribution of the selected statistic.
+  
   # ── Input validation ────────────────────────────────────────────────────
   if (!inherits(sf, "sf"))
     stop("Input must be an sf object")
   if (!is.function(summary_function))
     stop("summary_function must be a function")
-  if (!summary_field %in% colnames(sf))
-    stop(paste0("Field '", summary_field, "' does not exist, please check column names"))
-  if (!is.numeric(sf[[summary_field]]))
-    stop(paste0("Field '", summary_field, "' must be numeric"))
+  summary_field <- validate_summary_fields(sf, summary_field)
+  if (!is.numeric(alpha) || alpha <= 0)
+    stop("alpha must be a positive number")
+  if (!is.numeric(n_iterations) || n_iterations < 1)
+    stop("n_iterations must be a positive integer")
+  if (!is.numeric(max_iter) || max_iter < 1)
+    stop("max_iter must be a positive integer")
+  if (!is.numeric(tol_ratio) || tol_ratio <= 0 || tol_ratio >= 1)
+    stop("tol_ratio must be in the open interval (0, 1)")
+  
+  # Force lazily evaluated arguments before they are captured by PSOCK
+  # workers. This avoids expressions such as continuous_plan[[fig_id]]$alpha
+  # being evaluated later inside workers where continuous_plan does not exist.
+  alpha        <- as.numeric(alpha)
+  n_iterations <- as.integer(n_iterations)
+  max_iter     <- as.integer(max_iter)
+  tol_ratio    <- as.numeric(tol_ratio)
   
   if (!is.null(random_seed)) set.seed(random_seed)
   
@@ -863,7 +1343,7 @@ continuous_sensitivity <- function(
   # Recorded once on the untouched data so every iteration's result can be
   # compared against a single, stable reference value.
   origin_value <- tryCatch(
-    summary_function(sf[[summary_field]]),
+    call_summary_function(sf, summary_field, summary_function),
     error = function(e) stop(paste0("summary_function failed: ", e$message))
   )
   message(sprintf("Baseline statistic: %.6f", origin_value))
@@ -882,46 +1362,77 @@ continuous_sensitivity <- function(
   # ── Main loop ───────────────────────────────────────────────────────────
   # Each iteration starts from the original `sf` (not the previous result),
   # so the n_iterations runs are mutually independent Monte-Carlo samples.
-  for (run in seq_len(n_iterations)) {
+  sf_local               <- sf
+  field_rules_local      <- field_rules
+  summary_field_local    <- summary_field
+  summary_function_local <- summary_function
+  continuous_op          <- get("continuous_reassignment_operation", mode = "function", inherits = TRUE)
+  splitting_operation    <- get("splitting_operation", mode = "function", inherits = TRUE)
+  merging_operation      <- get("merging_operation", mode = "function", inherits = TRUE)
+  call_summary_function  <- get("call_summary_function", mode = "function", inherits = TRUE)
+  validate_summary_fields <- get("validate_summary_fields", mode = "function", inherits = TRUE)
+  environment(continuous_op) <- environment()
+  
+  run_one_continuous <- function(run) {
+    # Run one independent continuous reassignment simulation.
     
     res <- tryCatch(
-      continuous_reassignment_operation(
-        sf               = sf,
+      continuous_op(
+        sf               = sf_local,
         alpha            = alpha,
-        field_rules      = field_rules,
-        summary_field    = summary_field,
-        summary_function = summary_function,
+        field_rules      = field_rules_local,
+        summary_field    = summary_field_local,
+        summary_function = summary_function_local,
         max_iter         = max_iter,
         tol_ratio        = tol_ratio
       ),
       error = function(e) {
-        warning(sprintf("Run %d failed: %s", run, e$message))
-        NULL
+        return(list(error = sprintf("Run %d failed: %s", run, e$message)))
       }
     )
     
-    # Failed runs (NULL) are skipped silently; only successful runs
-    # contribute a row to the distribution.
-    if (!is.null(res)) {
-      results <- rbind(results, data.frame(
-        iteration       = run,
-        value           = res$stat_after,
-        total_failure   = res$total_failure,
-        remaining_alpha = res$remaining_alpha,
-        stringsAsFactors = FALSE
-      ))
-    }
+    if (is.list(res) && !is.null(res$error)) return(res)
     
-    # Coarse-grained progress reporting: avoids flooding the console on
-    # large n_iterations while still giving the user a sense of progress.
-    if (run %% 10 == 0 || run == n_iterations) {
-      message(sprintf("Progress: %d/%d completed (%d successful)",
-                      run, n_iterations, nrow(results)))
-    }
+    data.frame(
+      iteration       = run,
+      value           = res$stat_after,
+      total_failure   = res$total_failure,
+      remaining_alpha = res$remaining_alpha,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  run_results <- run_monte_carlo(
+    X              = seq_len(n_iterations),
+    FUN            = run_one_continuous,
+    parallel       = parallel,
+    n_workers      = n_workers,
+    random_seed    = random_seed,
+    export_names   = summary_function_export_names(summary_function),
+    export_env     = environment(summary_function),
+    progress_label = "Continuous sensitivity"
+  )
+  
+  error_messages <- vapply(
+    Filter(function(x) is.list(x) && !is.null(x$error), run_results),
+    function(x) x$error,
+    character(1)
+  )
+  valid_results <- Filter(is.data.frame, run_results)
+  results <- if (length(valid_results) > 0L) {
+    do.call(rbind, valid_results)
+  } else {
+    results
   }
   
   message(sprintf("Done: %d/%d successful runs collected",
                   nrow(results), n_iterations))
+  if (length(error_messages) > 0L) {
+    warning(sprintf(
+      "First continuous reassignment failure messages:\n%s",
+      paste(utils::head(unique(error_messages), 5L), collapse = "\n")
+    ))
+  }
   
   out <- list(
     origin_value = origin_value,
@@ -951,6 +1462,9 @@ discrete_reassignment_operation <- function(
     coarse_id,
     field_rules
 ) {
+  # Move one fine unit from its current coarse unit to a neighboring coarse
+  # unit, then update coarse-level attributes and geometries.
+  
   # ── Locate source coarse polygon ────────────────────────────────────────
   # `coarse_id` is the polygon that currently owns the fine unit `i`.
   # If it cannot be found in sf_coarse, abort by returning NULL so the
@@ -1034,7 +1548,7 @@ discrete_reassignment_operation <- function(
   return(list(sf_fine = sf_fine, sf_coarse = sf_coarse))
 }
 
-discrete_area_sensitivity <- function(
+discrete_reassignment_sensitivity_area <- function(
     finer_sf,
     coarser_sf,
     field_rules,
@@ -1044,15 +1558,18 @@ discrete_area_sensitivity <- function(
     summary_function,
     tol_ratio  = 0.1,
     keep_maps  = FALSE,
+    random_seed = NULL,
+    parallel   = FALSE,
+    n_workers  = default_parallel_workers(),
     save_path  = NULL        # If non-NULL, results are saved as a .rds file
 ) {
+  # Run discrete reassignment simulations constrained by a total reassigned
+  # area budget and summarize the statistic after each simulation.
+  
   # ── Input validation ────────────────────────────────────────────────────
   if (!inherits(finer_sf,   "sf")) stop("finer_sf must be an sf object")
   if (!inherits(coarser_sf, "sf")) stop("coarser_sf must be an sf object")
-  if (!summary_field %in% names(coarser_sf))
-    stop(sprintf("Field '%s' does not exist in coarser_sf", summary_field))
-  if (!is.numeric(coarser_sf[[summary_field]]))
-    stop("summary_field is not numeric")
+  summary_field <- validate_summary_fields(coarser_sf, summary_field, "coarser_sf")
   if (!is.function(summary_function))
     stop("summary_function must be a function")
   if (!is.numeric(alpha) || alpha <= 0)
@@ -1066,12 +1583,113 @@ discrete_area_sensitivity <- function(
   
   n_iterations <- as.integer(n_iterations)
   delta_alpha  <- tol_ratio * alpha
+  if (!is.null(random_seed)) set.seed(random_seed)
   
   # ── Baseline statistic & precomputation ─────────────────────────────────
-  origin_value  <- summary_function(coarser_sf[[summary_field]])
+  origin_value  <- call_summary_function(coarser_sf, summary_field, summary_function)
   neighbor_list <- st_touches(coarser_sf, sparse = TRUE)
   fine_areas    <- as.numeric(st_area(finer_sf))
+  error_messages <- character(0)
   
+  if (isTRUE(parallel)) {
+    field_rules_local      <- field_rules
+    summary_field_local    <- summary_field
+    summary_function_local <- summary_function
+    keep_maps_local        <- keep_maps
+    neighbor_list_local    <- neighbor_list
+    fine_areas_local       <- fine_areas
+    reassignment_op        <- get("discrete_reassignment_operation", mode = "function", inherits = TRUE)
+    call_summary_fn        <- get("call_summary_function", mode = "function", inherits = TRUE)
+    
+    run_one_discrete_area <- function(iter) {
+      # Run one area-budgeted discrete reassignment simulation.
+      budget <- runif(1, min = alpha - delta_alpha,
+                      max = alpha + delta_alpha)
+      
+      current_fine   <- finer_sf
+      current_coarse <- coarser_sf
+      remaining      <- budget
+      available_ids  <- current_fine$ID
+      any_reassigned <- FALSE
+      attempt_error   <- NULL
+      
+      while (remaining > 0 && length(available_ids) > 0L) {
+        fine_id  <- sample(available_ids, 1)
+        fine_row <- which(current_fine$ID == fine_id)
+        area_i   <- fine_areas_local[fine_row]
+        
+        if (area_i > remaining) {
+          available_ids <- setdiff(available_ids, fine_id)
+          next
+        }
+        
+        coarse_id <- current_fine$coarse_ID[fine_row]
+        
+        result <- tryCatch(
+          reassignment_op(
+            sf_fine       = current_fine,
+            sf_coarse     = current_coarse,
+            i             = fine_row,
+            neighbor_list = neighbor_list_local,
+            fine_id       = fine_id,
+            coarse_id     = coarse_id,
+            field_rules   = field_rules_local
+          ),
+          error = function(e) {
+            attempt_error <<- sprintf(
+              "area reassignment failed at iteration %d, fine ID=%s: %s",
+              iter, fine_id, e$message
+            )
+            NULL
+          }
+        )
+        
+        if (is.null(result)) {
+          available_ids <- setdiff(available_ids, fine_id)
+          next
+        }
+        
+        remaining      <- remaining - area_i
+        current_fine   <- result$sf_fine
+        current_coarse <- result$sf_coarse
+        available_ids  <- setdiff(available_ids, fine_id)
+        any_reassigned <- TRUE
+      }
+      
+      if (!any_reassigned) {
+        if (is.null(attempt_error)) {
+          attempt_error <- sprintf(
+            "no eligible fine unit could be reassigned within the area budget in iteration %d",
+            iter
+          )
+        }
+        return(list(error = attempt_error))
+      }
+      
+      list(
+        stat_after = call_summary_fn(current_coarse, summary_field_local, summary_function_local),
+        updated_sf = if (keep_maps_local) current_coarse else NULL
+      )
+    }
+    
+    results <- run_monte_carlo(
+      X              = seq_len(n_iterations),
+      FUN            = run_one_discrete_area,
+      parallel       = TRUE,
+      n_workers      = n_workers,
+      random_seed    = random_seed,
+      export_names   = summary_function_export_names(summary_function),
+      export_env     = environment(summary_function),
+      progress_label = "Discrete area sensitivity"
+    )
+    error_messages <- vapply(
+      Filter(function(x) is.list(x) && !is.null(x$error), results),
+      function(x) x$error,
+      character(1)
+    )
+    results <- Filter(function(x) is.list(x) && !is.null(x$stat_after), results)
+    success_count <- length(results)
+  } else {
   results       <- vector("list", n_iterations)
   success_count <- 0L
   
@@ -1128,16 +1746,31 @@ discrete_area_sensitivity <- function(
     if (any_reassigned) {
       success_count   <- success_count + 1L
       results[[iter]] <- list(
-        stat_after = summary_function(current_coarse[[summary_field]]),
+        stat_after = call_summary_function(current_coarse, summary_field, summary_function),
         updated_sf = if (keep_maps) current_coarse else NULL
       )
     }
   }
+  }
   
   # ── Assemble distribution & deviation summary ───────────────────────────
-  valid        <- Filter(Negate(is.null), results)
-  distribution <- data.frame(value = sapply(valid, `[[`, "stat_after"))
+  valid <- Filter(function(x) is.list(x) && !is.null(x$stat_after), results)
+  distribution <- if (length(valid) > 0L) {
+    data.frame(value = vapply(valid, function(x) x$stat_after, numeric(1)))
+  } else {
+    data.frame(value = numeric(0))
+  }
   devs         <- distribution$value / origin_value
+  
+  if (success_count == 0L) {
+    warning("No successful discrete area reassignment simulations were collected.")
+  }
+  if (length(error_messages) > 0L) {
+    warning(sprintf(
+      "First discrete area failure messages:\n%s",
+      paste(utils::head(unique(error_messages), 5L), collapse = "\n")
+    ))
+  }
   
   out <- list(
     origin_value  = origin_value,
@@ -1166,7 +1799,7 @@ discrete_area_sensitivity <- function(
 }
 
 
-discrete_region_sensitivity <- function(
+discrete_reassignment_sensitivity_regions <- function(
     finer_sf,
     coarser_sf,
     field_rules,
@@ -1174,15 +1807,18 @@ discrete_region_sensitivity <- function(
     n_iterations,
     summary_function,
     summary_field,
+    random_seed = NULL,
+    parallel    = FALSE,
+    n_workers   = default_parallel_workers(),
     save_path = NULL          # If non-NULL, results are saved as a .rds file
 ) {
+  # Run discrete reassignment simulations constrained by the number of fine
+  # regions moved and summarize the statistic after each simulation.
+  
   # ── Input validation ────────────────────────────────────────────────────
   if (!inherits(finer_sf,   "sf")) stop("finer_sf must be an sf object")
   if (!inherits(coarser_sf, "sf")) stop("coarser_sf must be an sf object")
-  if (!summary_field %in% names(coarser_sf))
-    stop(sprintf("Field '%s' does not exist in coarser_sf", summary_field))
-  if (!is.numeric(coarser_sf[[summary_field]]))
-    stop("summary_field is not numeric")
+  summary_field <- validate_summary_fields(coarser_sf, summary_field, "coarser_sf")
   if (!is.function(summary_function))
     stop("summary_function must be a function")
   if (!is.numeric(k_regions) || k_regions < 1)
@@ -1194,15 +1830,23 @@ discrete_region_sensitivity <- function(
   
   k_regions    <- as.integer(k_regions)
   n_iterations <- as.integer(n_iterations)
+  if (!is.null(random_seed)) set.seed(random_seed)
   
   # ── Baseline statistic & precomputation ─────────────────────────────────
-  origin_value  <- summary_function(coarser_sf[[summary_field]])
+  origin_value  <- call_summary_function(coarser_sf, summary_field, summary_function)
   neighbor_list <- st_touches(coarser_sf, sparse = TRUE)
+  field_rules_local      <- field_rules
+  summary_field_local    <- summary_field
+  summary_function_local <- summary_function
+  neighbor_list_local    <- neighbor_list
+  reassignment_op        <- get("discrete_reassignment_operation", mode = "function", inherits = TRUE)
+  call_summary_fn        <- get("call_summary_function", mode = "function", inherits = TRUE)
   
-  distribution <- numeric(n_iterations)
+  run_one_discrete_region <- function(iter) {
+    # Run one fixed-count discrete reassignment simulation.
   
   # ── Main Monte-Carlo loop ───────────────────────────────────────────────
-  for (iter in seq_len(n_iterations)) {
+  {
     
     current_fine   <- finer_sf
     current_coarse <- coarser_sf
@@ -1219,14 +1863,14 @@ discrete_region_sensitivity <- function(
       coarse_id <- current_fine$coarse_ID[fine_row]
       
       result <- tryCatch(
-        discrete_reassignment_operation(
+        reassignment_op(
           sf_fine       = current_fine,
           sf_coarse     = current_coarse,
           i             = fine_row,
-          neighbor_list = neighbor_list,
+          neighbor_list = neighbor_list_local,
           fine_id       = fine_id,
           coarse_id     = coarse_id,
-          field_rules   = field_rules
+          field_rules   = field_rules_local
         ),
         error = function(e) NULL
       )
@@ -1237,8 +1881,20 @@ discrete_region_sensitivity <- function(
       current_coarse <- result$sf_coarse
     }
     
-    distribution[iter] <- summary_function(current_coarse[[summary_field]])
+    call_summary_fn(current_coarse, summary_field_local, summary_function_local)
   }
+  }
+  
+  distribution <- unlist(run_monte_carlo(
+    X              = seq_len(n_iterations),
+    FUN            = run_one_discrete_region,
+    parallel       = parallel,
+    n_workers      = n_workers,
+    random_seed    = random_seed,
+    export_names   = summary_function_export_names(summary_function),
+    export_env     = environment(summary_function),
+    progress_label = "Discrete region sensitivity"
+  ))
   
   out <- list(
     origin_value = origin_value,
@@ -1272,6 +1928,9 @@ plot_and_save <- function(
     theme_style     = "minimal",
     device          = "png"
 ) {
+  # Convert a saved or in-memory sensitivity result into standardized
+  # histogram/density plots and optionally save them to disk.
+  
   # ── 0. Parse input source (in-memory object OR .rds file, choose one) ─────
   if (is.null(result_obj) && is.null(rds_path))
     stop("Either result_obj or rds_path must be provided.")
@@ -1295,6 +1954,63 @@ plot_and_save <- function(
   # ── 1. Data validation and extraction ─────────────────────────────────────
   if (!is.list(result_obj))
     stop("result_obj must be a list (or a list read from an .rds file).")
+  
+  is_result_collection <- !"distribution" %in% names(result_obj) &&
+    length(result_obj) > 0L &&
+    all(vapply(
+      result_obj,
+      function(x) {
+        is.list(x) &&
+          "origin_value" %in% names(x) &&
+          "distribution" %in% names(x) &&
+          "value" %in% colnames(x$distribution)
+      },
+      logical(1)
+    ))
+  
+  if (is_result_collection) {
+    collection_k_levels <- vapply(seq_along(result_obj), function(idx) {
+      res <- result_obj[[idx]]
+      df  <- res$distribution
+      
+      if ("k_order" %in% names(res)) {
+        res$k_order
+      } else if ("k" %in% names(df) && nrow(df) > 0L) {
+        max(df$k, na.rm = TRUE)
+      } else {
+        idx
+      }
+    }, numeric(1))
+    
+    dist_df <- do.call(rbind, lapply(seq_along(result_obj), function(idx) {
+      res <- result_obj[[idx]]
+      df  <- res$distribution
+      k_level <- collection_k_levels[idx]
+      
+      if ("k" %in% names(df)) {
+        df <- df[df$k == k_level, , drop = FALSE]
+      }
+      if (nrow(df) == 0L) {
+        return(data.frame(k = numeric(0), value = numeric(0)))
+      }
+      
+      data.frame(
+        k     = rep(k_level, nrow(df)),
+        value = df$value / res$origin_value,
+        stringsAsFactors = FALSE
+      )
+    }))
+    if (is.null(dist_df)) {
+      dist_df <- data.frame(k = numeric(0), value = numeric(0))
+    }
+    
+    result_obj <- list(
+      origin_value = 1,
+      k_order      = max(collection_k_levels, na.rm = TRUE),
+      distribution = dist_df
+    )
+  }
+  
   if (!"origin_value" %in% names(result_obj))
     stop("result_obj is missing 'origin_value'.")
   if (!"distribution" %in% names(result_obj))
@@ -1351,6 +2067,7 @@ plot_and_save <- function(
   
   # ── 5. Single plot factory function ───────────────────────────────────────
   make_panel <- function(df, k_level) {
+    # Build one standardized plot panel for a single k level.
     
     df <- df %>% filter(is.finite(ratio))
     
@@ -1505,4 +2222,135 @@ plot_and_save <- function(
   }
   
   invisible(if (k_order_max == 1) plots[[1]] else plots)
+}
+
+combine_sensitivity_plots <- function(
+    plots      = NULL,
+    result_obj = NULL,
+    rds_path   = NULL,
+    filename,
+    ncol       = 5,
+    nrow       = NULL,
+    width      = 35,
+    height     = 6,
+    dpi        = 300,
+    device     = "png",
+    add_k_titles = TRUE,
+    bottom_x_only = TRUE,
+    x_title = "Summary function (standardized)",
+    ...
+) {
+  # Combine multiple sensitivity plots into one publication-ready figure.
+  # Plots can be supplied directly or generated from a result object/RDS file.
+  
+  if (missing(filename) || is.null(filename) || !nzchar(filename)) {
+    stop("filename must be provided")
+  }
+  
+  if (is.null(plots)) {
+    plots <- plot_and_save(
+      result_obj      = result_obj,
+      rds_path        = rds_path,
+      filename_prefix = NULL,
+      device          = device,
+      ...
+    )
+  }
+  
+  if (inherits(plots, "ggplot")) {
+    plots <- list(plots)
+  }
+  
+  if (!is.list(plots) || length(plots) == 0L) {
+    stop("plots must be a ggplot object or a non-empty list of ggplot objects")
+  }
+  
+  if (!all(vapply(plots, inherits, logical(1), what = "ggplot"))) {
+    stop("all elements in plots must be ggplot objects")
+  }
+  
+  k_labels <- names(plots)
+  if (is.null(k_labels) || all(!nzchar(k_labels))) {
+    k_labels <- as.character(seq_along(plots))
+  } else {
+    k_labels <- sub("^k", "", k_labels)
+  }
+  
+  plots <- lapply(seq_along(plots), function(idx) {
+    p <- plots[[idx]]
+    
+    if (isTRUE(add_k_titles)) {
+      p <- p +
+        ggtitle(paste0("k = ", k_labels[idx])) +
+        theme(
+          plot.title = element_text(
+            hjust = 0.5,
+            face = "plain",
+            size = 14
+          )
+        )
+    }
+    
+    if (isTRUE(bottom_x_only)) {
+      if (idx < length(plots)) {
+        p <- p +
+          labs(x = NULL) +
+          theme(
+            axis.title.x = element_blank()
+          )
+      } else {
+        p <- p +
+          labs(x = x_title)
+      }
+    }
+    
+    p
+  })
+  
+  n_plots <- length(plots)
+  ncol <- min(as.integer(ncol), n_plots)
+  if (is.null(nrow)) {
+    nrow <- ceiling(n_plots / ncol)
+  } else {
+    nrow <- as.integer(nrow)
+  }
+  
+  if (ncol < 1L || nrow < 1L || nrow * ncol < n_plots) {
+    stop("nrow and ncol do not provide enough cells for all plots")
+  }
+  
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  
+  device <- tolower(device)
+  if (device == "png") {
+    png(filename, width = width, height = height, units = "cm", res = dpi, type = "cairo")
+  } else if (device == "pdf") {
+    pdf(filename, width = width / 2.54, height = height / 2.54)
+  } else if (device %in% c("jpg", "jpeg")) {
+    jpeg(filename, width = width, height = height, units = "cm", res = dpi, quality = 95)
+  } else if (device == "tiff") {
+    tiff(filename, width = width, height = height, units = "cm", res = dpi, compression = "lzw")
+  } else {
+    stop("device must be one of: png, pdf, jpg, jpeg, tiff")
+  }
+  on.exit(dev.off(), add = TRUE)
+  
+  grid::grid.newpage()
+  grid::pushViewport(grid::viewport(layout = grid::grid.layout(nrow, ncol)))
+  
+  for (idx in seq_along(plots)) {
+    row_id <- ((idx - 1L) %/% ncol) + 1L
+    col_id <- ((idx - 1L) %% ncol) + 1L
+    
+    print(
+      plots[[idx]],
+      vp = grid::viewport(
+        layout.pos.row = row_id,
+        layout.pos.col = col_id
+      )
+    )
+  }
+  
+  message(sprintf("Combined plot saved: %s", filename))
+  invisible(filename)
 }
