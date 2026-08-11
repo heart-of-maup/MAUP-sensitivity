@@ -1,10 +1,13 @@
 # On the sensitivities to the modifiable areal unit problem
 # Raster sensitivity functions
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
-# 2026-07-01
+# 2026-08-12
+
+# Please cite the following reference when part or all of the code in this file is reused under the license of CC-BY-4.0:
+# Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit problem. Big Earth Data, 1–36. https://doi.org/10.1080/20964471.2026.2692263
 
 # This file stores raster-based MAUP sensitivity functions.
-# It is designed to be sourced from the raster walk-through script.
+# It is designed to be sourced from the raster walkthrough script.
 
 default_parallel_workers_raster <- function(reserve_cores = 1L) {
   # Choose a conservative number of parallel workers.
