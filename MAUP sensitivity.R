@@ -1,7 +1,7 @@
 # On the sensitivities to the modifiable areal unit problem
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-06-16
+# 2026-08-10
 
 library(geojsonio)
 library(readxl)
@@ -254,7 +254,7 @@ calculate_merge_complexity <- function(sf_object, n_simulations = 1000) {
     remove.multiple = TRUE,
     remove.loops = TRUE
   )
-  
+
   max_k <- igraph::vcount(g_initial) - 1L
   if (max_k < 1L) {
     return(data.frame(
@@ -1330,8 +1330,9 @@ continuous_reassignment_sensitivity <- function(
     stop("tol_ratio must be in the open interval (0, 1)")
   
   # Force lazily evaluated arguments before they are captured by PSOCK
-  # workers. This avoids expressions such as continuous_plan[[fig_id]]$alpha
-  # being evaluated later inside workers where continuous_plan does not exist.
+  # workers. This avoids expressions such as
+  # continuous_reassignment_plan[[fig_id]]$alpha being evaluated later inside
+  # workers where the plan object does not exist.
   alpha        <- as.numeric(alpha)
   n_iterations <- as.integer(n_iterations)
   max_iter     <- as.integer(max_iter)
@@ -1349,15 +1350,21 @@ continuous_reassignment_sensitivity <- function(
   message(sprintf("Baseline statistic: %.6f", origin_value))
   
   # ── Initialize result container ─────────────────────────────────────────
-  results <- data.frame(
+  attempt_results <- data.frame(
     iteration       = integer(0),
     value           = numeric(0),
+    converged       = logical(0),
+    termination_reason = character(0),
     total_failure   = integer(0),
     remaining_alpha = numeric(0),
+    successful_steps = integer(0),
     stringsAsFactors = FALSE
   )
-  
-  message(sprintf("Starting continuous sensitivity analysis: %d iterations", n_iterations))
+
+  message(sprintf(
+    "Starting continuous reassignment sensitivity analysis: %d iterations",
+    n_iterations
+  ))
   
   # ── Main loop ───────────────────────────────────────────────────────────
   # Each iteration starts from the original `sf` (not the previous result),
@@ -1367,10 +1374,18 @@ continuous_reassignment_sensitivity <- function(
   summary_field_local    <- summary_field
   summary_function_local <- summary_function
   continuous_op          <- get("continuous_reassignment_operation", mode = "function", inherits = TRUE)
-  splitting_operation    <- get("splitting_operation", mode = "function", inherits = TRUE)
+  guided_path_fn         <- get("generate_smooth_guided_path", mode = "function", inherits = TRUE)
+  split_op               <- get("splitting_operation", mode = "function", inherits = TRUE)
   merging_operation      <- get("merging_operation", mode = "function", inherits = TRUE)
   call_summary_function  <- get("call_summary_function", mode = "function", inherits = TRUE)
   validate_summary_fields <- get("validate_summary_fields", mode = "function", inherits = TRUE)
+
+  # Make the splitter self-contained before the worker closure is serialized.
+  # splitting_operation() calls generate_smooth_guided_path(), which is not
+  # otherwise available in a fresh PSOCK worker's global environment.
+  generate_smooth_guided_path <- guided_path_fn
+  environment(split_op) <- environment()
+  splitting_operation <- split_op
   environment(continuous_op) <- environment()
   
   run_one_continuous <- function(run) {
@@ -1396,8 +1411,11 @@ continuous_reassignment_sensitivity <- function(
     data.frame(
       iteration       = run,
       value           = res$stat_after,
+      converged       = isTRUE(res$converged),
+      termination_reason = as.character(res$termination_reason),
       total_failure   = res$total_failure,
       remaining_alpha = res$remaining_alpha,
+      successful_steps = nrow(res$step_log),
       stringsAsFactors = FALSE
     )
   }
@@ -1410,7 +1428,7 @@ continuous_reassignment_sensitivity <- function(
     random_seed    = random_seed,
     export_names   = summary_function_export_names(summary_function),
     export_env     = environment(summary_function),
-    progress_label = "Continuous sensitivity"
+    progress_label = "Continuous reassignment sensitivity"
   )
   
   error_messages <- vapply(
@@ -1418,15 +1436,49 @@ continuous_reassignment_sensitivity <- function(
     function(x) x$error,
     character(1)
   )
-  valid_results <- Filter(is.data.frame, run_results)
-  results <- if (length(valid_results) > 0L) {
-    do.call(rbind, valid_results)
+  returned_attempts <- Filter(is.data.frame, run_results)
+  attempt_results <- if (length(returned_attempts) > 0L) {
+    do.call(rbind, returned_attempts)
   } else {
-    results
+    attempt_results
   }
-  
-  message(sprintf("Done: %d/%d successful runs collected",
-                  nrow(results), n_iterations))
+
+  # Only completed area-budget paths define the sensitivity distribution.
+  # Non-converged attempts remain available in diagnostics but must not be
+  # plotted as if their unchanged or partially changed values were valid.
+  converged_mask <- attempt_results$converged & is.finite(attempt_results$value)
+  results <- attempt_results[
+    converged_mask,
+    c("iteration", "value", "total_failure", "remaining_alpha"),
+    drop = FALSE
+  ]
+
+  n_converged     <- nrow(results)
+  n_nonconverged  <- sum(!attempt_results$converged)
+  n_worker_errors <- length(error_messages)
+
+  message(sprintf(
+    "Done: %d/%d converged runs collected (%d non-converged, %d worker errors)",
+    n_converged,
+    n_iterations,
+    n_nonconverged,
+    n_worker_errors
+  ))
+
+  if (n_nonconverged > 0L) {
+    failed_reasons <- attempt_results$termination_reason[!attempt_results$converged]
+    reason_counts <- table(failed_reasons, useNA = "ifany")
+    reason_summary <- paste0(
+      names(reason_counts), "=", as.integer(reason_counts),
+      collapse = ", "
+    )
+    warning(sprintf(
+      "%d continuous reassignment runs did not converge and were excluded from the distribution. Reasons: %s",
+      n_nonconverged,
+      reason_summary
+    ))
+  }
+
   if (length(error_messages) > 0L) {
     warning(sprintf(
       "First continuous reassignment failure messages:\n%s",
@@ -1437,7 +1489,25 @@ continuous_reassignment_sensitivity <- function(
   out <- list(
     origin_value = origin_value,
     distribution = results,
-    field_used   = summary_field
+    field_used   = summary_field,
+    diagnostics  = list(
+      requested_iterations = n_iterations,
+      converged_runs       = n_converged,
+      nonconverged_runs    = n_nonconverged,
+      worker_errors        = n_worker_errors,
+      attempts             = attempt_results[
+        , c(
+          "iteration",
+          "converged",
+          "termination_reason",
+          "total_failure",
+          "remaining_alpha",
+          "successful_steps"
+        ),
+        drop = FALSE
+      ],
+      error_messages       = unname(error_messages)
+    )
   )
   
   # ── Persist to disk (optional) ──────────────────────────────────────────
@@ -1680,7 +1750,7 @@ discrete_reassignment_sensitivity_area <- function(
       random_seed    = random_seed,
       export_names   = summary_function_export_names(summary_function),
       export_env     = environment(summary_function),
-      progress_label = "Discrete area sensitivity"
+      progress_label = "Discrete reassignment sensitivity by area"
     )
     error_messages <- vapply(
       Filter(function(x) is.list(x) && !is.null(x$error), results),
@@ -1893,7 +1963,7 @@ discrete_reassignment_sensitivity_regions <- function(
     random_seed    = random_seed,
     export_names   = summary_function_export_names(summary_function),
     export_env     = environment(summary_function),
-    progress_label = "Discrete region sensitivity"
+    progress_label = "Discrete reassignment sensitivity by number of regions"
   ))
   
   out <- list(

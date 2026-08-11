@@ -1,9 +1,12 @@
 # On the sensitivities to the modifiable areal unit problem
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-07-02
+# 2026-08-10
 
+# ============================================================
 # 0. Setup
+# ============================================================
+
 library(geojsonio)
 library(readxl)
 library(tidyverse)
@@ -12,11 +15,44 @@ library(lwgeom)
 library(ggplot2)
 library(spdep)
 
+# ------------------------------------------------------------
+# 0.1 Set project directory and source functions
+# ------------------------------------------------------------
+
 # Set project directory
 project_dir <- "D:/Change_to_your_local_path"
 
 # Source the core sensitivity functions and plotting function
 source(file.path(project_dir, "MAUP sensitivity.R"))
+
+# ------------------------------------------------------------
+# 0.2 Required input folders and files
+# ------------------------------------------------------------
+
+# Put all vector-related input data under the project's data folder.
+# The following folders and files are required:
+#
+# (a) 2023 U.S. county boundary shapefile
+#     data/US_county/tl_2023_us_county.shp
+#     data/US_county/tl_2023_us_county.dbf
+#     data/US_county/tl_2023_us_county.shx
+#     data/US_county/tl_2023_us_county.prj
+#
+# (b) 2023 New York county subdivision boundary shapefile
+#     data/US_subcounty/tl_2023_36_cousub.shp
+#     data/US_subcounty/tl_2023_36_cousub.dbf
+#     data/US_subcounty/tl_2023_36_cousub.shx
+#     data/US_subcounty/tl_2023_36_cousub.prj
+#
+# (c) 2023 ACS five-year subject tables
+#     data/ACSST5Y2023.S2701-Data.csv
+#     data/ACSST5Y2023.S0101-Data.csv
+#
+# If the data are stored elsewhere, change the paths in Sections 1 and 2.
+
+# ------------------------------------------------------------
+# 0.3 Create output folders
+# ------------------------------------------------------------
 
 dir.create(file.path(project_dir, "outputs"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(project_dir, "outputs", "rds"), recursive = TRUE, showWarnings = FALSE)
@@ -25,12 +61,19 @@ dir.create(file.path(project_dir, "outputs", "figures"), recursive = TRUE, showW
 rds_dir <- file.path(project_dir, "outputs", "rds")
 fig_dir <- file.path(project_dir, "outputs", "figures")
 
+# ------------------------------------------------------------
+# 0.4 Configure parallel Monte Carlo execution
+# ------------------------------------------------------------
+
 # Parallel Monte Carlo settings.
 # Set use_parallel <- FALSE if you want the original serial behavior.
 use_parallel <- TRUE
 parallel_workers <- max(1L, parallel::detectCores(logical = TRUE) - 5L)
 
+# ============================================================
 # 1. Load spatial data
+# ============================================================
+
 # Replace these file names with the actual shapefile names in your data folder
 county_shp <- file.path(project_dir, "data", "US_county", "tl_2023_us_county.shp")
 subcounty_shp <- file.path(project_dir, "data", "US_subcounty", "tl_2023_36_cousub.shp")
@@ -60,7 +103,10 @@ subcounty <- subcounty %>%
   st_make_valid() %>%
   st_transform(6350)
 
+# ============================================================
 # 2. Load ACS attribute tables
+# ============================================================
+
 # Define ACS CSV paths
 s2701_path <- file.path(project_dir, "data", "ACSST5Y2023.S2701-Data.csv")
 s0101_path <- file.path(project_dir, "data", "ACSST5Y2023.S0101-Data.csv")
@@ -85,7 +131,10 @@ names(s2701_raw) <- gsub("^\ufeff", "", names(s2701_raw))
 names(s0101_raw) <- gsub("^\ufeff", "", names(s0101_raw))
 
 
+# ============================================================
 # 3. Clean ACS S2701 variables
+# ============================================================
+
 # Geography identifier column
 col_geo <- "Geography"
 
@@ -122,7 +171,9 @@ county_attr_s2701 <- s2701_raw %>%
   )
 
 
+# ============================================================
 # 4. Clean ACS S0101 total population variable
+# ============================================================
 
 # Original ACS field name in S0101
 col_pop_tol <- "Estimate!!Total!!Total population"
@@ -145,7 +196,9 @@ county_attr_s0101 <- s0101_raw %>%
   )
 
 
+# ============================================================
 # 5. Join ACS attributes to the county shapefile
+# ============================================================
 
 # The shapefile usually contains a GEOID field.
 # If your shapefile uses a different field name, replace GEOID below.
@@ -179,7 +232,9 @@ if (length(missing_cols) > 0) {
 }
 
 
+# ============================================================
 # 6. Define value recalculation rules
+# ============================================================
 
 # Extensive variables are summed when regions are merged.
 # During splitting, they are allocated by area under the homogeneity assumption.
@@ -221,7 +276,9 @@ field_rules <- list(
   )
 )
 
+# ============================================================
 # 7. Define summary functions
+# ============================================================
 
 # Mean
 summary_mean <- function(x) {
@@ -444,6 +501,10 @@ for (fig_id in names(splitting_plan)) {
 # in New York
 # ============================================================
 
+# ------------------------------------------------------------
+# 10.1 Prepare New York county data and analysis settings
+# ------------------------------------------------------------
+
 # The S2701 table provides counts for total household population and
 # household population in the $100,000-and-over category. The percentage
 # variable used here is computed as:
@@ -467,6 +528,10 @@ county_ny_high_order <- county %>%
 
 high_order_fields <- c("ins_rate", "hh_inc_100k_plus_rate")
 high_order_k <- 1:5
+
+# ------------------------------------------------------------
+# 10.2 Run high-order merging sensitivity and save plots
+# ------------------------------------------------------------
 
 high_order_merging_results <- vector("list", length(high_order_k))
 names(high_order_merging_results) <- paste0("k", high_order_k)
@@ -511,6 +576,10 @@ combine_sensitivity_plots(
 )
 
 
+# ------------------------------------------------------------
+# 10.3 Run high-order splitting sensitivity and save plots
+# ------------------------------------------------------------
+
 high_order_splitting_results <- vector("list", length(high_order_k))
 names(high_order_splitting_results) <- paste0("k", high_order_k)
 
@@ -552,7 +621,7 @@ combine_sensitivity_plots(
   device   = "png"
 )
 # ============================================================
-# 11. Continuous sensitivity
+# 11. Continuous reassignment sensitivity
 # Manuscript Example set IV: continuous reassignment sensitivity of the coefficient
 # of variation of county population in New York
 # ============================================================
@@ -561,7 +630,7 @@ combine_sensitivity_plots(
 # 11.1 Prepare New York county layer
 # ------------------------------------------------------------
 
-county_ny_continuous <- county %>%
+county_ny_continuous_reassignment <- county %>%
   filter(STATEFP == "36") %>%
   filter(
     !is.na(pop_tol),
@@ -575,18 +644,21 @@ county_ny_continuous <- county %>%
   ) %>%
   st_make_valid()
 
-if (nrow(county_ny_continuous) == 0) {
-  stop("county_ny_continuous has 0 rows. Please check whether pop_tol was successfully joined.")
+if (nrow(county_ny_continuous_reassignment) == 0) {
+  stop("county_ny_continuous_reassignment has 0 rows. Please check whether pop_tol was successfully joined.")
 }
 
-message("Number of New York counties used for continuous sensitivity: ", nrow(county_ny_continuous))
+message(
+  "Number of New York counties used for continuous reassignment sensitivity: ",
+  nrow(county_ny_continuous_reassignment)
+)
 
 
 # ------------------------------------------------------------
 # 11.2 Calculate average county area
 # ------------------------------------------------------------
 
-county_area_m2 <- as.numeric(st_area(county_ny_continuous))
+county_area_m2 <- as.numeric(st_area(county_ny_continuous_reassignment))
 
 avg_county_area_m2 <- mean(
   county_area_m2[is.finite(county_area_m2) & county_area_m2 > 0],
@@ -603,23 +675,23 @@ message("Average New York county area: ", round(avg_county_area_km2, 2), " km^2"
 
 
 # ------------------------------------------------------------
-# 11.3 Define continuous sensitivity plan
+# 11.3 Define continuous reassignment sensitivity plan
 # ------------------------------------------------------------
 
-continuous_plan <- list(
-  fig_continuous_020 = list(
+continuous_reassignment_plan <- list(
+  fig_continuous_reassignment_020 = list(
     alpha = 0.2 * avg_county_area_m2,
     label = "20 percent of average county area"
   ),
-  fig_continuous_050 = list(
+  fig_continuous_reassignment_050 = list(
     alpha = 0.5 * avg_county_area_m2,
     label = "50 percent of average county area"
   ),
-  fig_continuous_100 = list(
+  fig_continuous_reassignment_100 = list(
     alpha = 1.0 * avg_county_area_m2,
     label = "100 percent of average county area"
   ),
-  fig_continuous_300 = list(
+  fig_continuous_reassignment_300 = list(
     alpha = 3.0 * avg_county_area_m2,
     label = "300 percent of average county area"
   )
@@ -627,19 +699,22 @@ continuous_plan <- list(
 
 
 # ------------------------------------------------------------
-# 11.4 Run continuous sensitivity and save plots
+# 11.4 Run continuous reassignment sensitivity and save plots
 # ------------------------------------------------------------
 
-for (fig_id in names(continuous_plan)) {
-  
-  message("Running ", fig_id, ": ", continuous_plan[[fig_id]]$label)
+for (fig_id in names(continuous_reassignment_plan)) {
+
+  message(
+    "Running ", fig_id, ": ",
+    continuous_reassignment_plan[[fig_id]]$label
+  )
   
   res <- continuous_reassignment_sensitivity(
-    sf               = county_ny_continuous,
+    sf               = county_ny_continuous_reassignment,
     field_rules      = field_rules,
     summary_field    = "pop_tol",
     summary_function = summary_cv,
-    alpha            = continuous_plan[[fig_id]]$alpha,
+    alpha            = continuous_reassignment_plan[[fig_id]]$alpha,
     n_iterations     = 100,
     max_iter         = 1000,
     tol_ratio        = 0.1,
@@ -662,7 +737,7 @@ for (fig_id in names(continuous_plan)) {
 
 
 # ============================================================
-# 12. Discrete sensitivity
+# 12. Discrete reassignment sensitivity
 # Manuscript Example set V: discrete reassignment sensitivity of Moran's I
 # of county population in the NY county-subdivision hierarchy
 # ============================================================
@@ -671,7 +746,7 @@ for (fig_id in names(continuous_plan)) {
 # 12.1 Prepare New York county layer as coarser_sf
 # ------------------------------------------------------------
 
-county_ny_discrete <- county %>%
+county_ny_discrete_reassignment <- county %>%
   filter(STATEFP == "36") %>%
   filter(!is.na(pop_tol)) %>%
   mutate(
@@ -679,8 +754,8 @@ county_ny_discrete <- county %>%
   ) %>%
   st_make_valid()
 
-# Lookup table: county_id -> coarse_ID used by discrete sensitivity functions
-county_id_lookup <- county_ny_discrete %>%
+# Lookup table: county_id -> coarse_ID used by discrete reassignment sensitivity functions
+county_id_lookup <- county_ny_discrete_reassignment %>%
   st_drop_geometry() %>%
   select(
     county_id,
@@ -707,7 +782,7 @@ subcounty_attr_s0101 <- s0101_raw %>%
 # 12.3 Prepare New York county subdivision layer as finer_sf
 # ------------------------------------------------------------
 
-subcounty_ny_discrete <- subcounty %>%
+subcounty_ny_discrete_reassignment <- subcounty %>%
   mutate(
     subcounty_id = as.character(GEOID),
     county_id = str_sub(subcounty_id, 1, 5)
@@ -723,8 +798,11 @@ subcounty_ny_discrete <- subcounty %>%
   ) %>%
   st_make_valid()
 
-message("Number of NY counties: ", nrow(county_ny_discrete))
-message("Number of NY county subdivisions: ", nrow(subcounty_ny_discrete))
+message("Number of NY counties: ", nrow(county_ny_discrete_reassignment))
+message(
+  "Number of NY county subdivisions: ",
+  nrow(subcounty_ny_discrete_reassignment)
+)
 
 
 # ------------------------------------------------------------
@@ -733,7 +811,7 @@ message("Number of NY county subdivisions: ", nrow(subcounty_ny_discrete))
 
 # pop_tol is an extensive variable.
 # After a fine unit is reassigned, county-level population is re-aggregated by sum.
-field_rules_discrete <- list(
+field_rules_discrete_reassignment <- list(
   pop_tol = list(
     merge = "sum"
   )
@@ -745,9 +823,9 @@ field_rules_discrete <- list(
 # ------------------------------------------------------------
 
 # Construct rook contiguity weights for the original NY county layer.
-# The discrete sensitivity functions keep the number of counties unchanged,
+# The discrete reassignment sensitivity functions keep the number of counties unchanged,
 # so this fixed listw can be used with the county-level population vector.
-neighbor_nb <- poly2nb(county_ny_discrete, queen = FALSE)
+neighbor_nb <- poly2nb(county_ny_discrete_reassignment, queen = FALSE)
 
 county_lw <- nb2listw(
   neighbor_nb,
@@ -771,7 +849,7 @@ summary_moran <- function(x) {
 # 12.6 Calculate area budget
 # ------------------------------------------------------------
 
-county_area_m2 <- as.numeric(st_area(county_ny_discrete))
+county_area_m2 <- as.numeric(st_area(county_ny_discrete_reassignment))
 
 avg_county_area_m2 <- mean(
   county_area_m2[is.finite(county_area_m2) & county_area_m2 > 0],
@@ -782,21 +860,21 @@ avg_county_area_km2 <- avg_county_area_m2 / 1e6
 
 message("Average NY county area: ", round(avg_county_area_km2, 2), " km^2")
 
-# Area budget for discrete area sensitivity.
+# Area budget for discrete reassignment sensitivity by area.
 # Use 1.0 * avg_county_area_m2 if you want one average county area.
-discrete_alpha <- 1.0 * avg_county_area_m2
+discrete_reassignment_alpha <- 1.0 * avg_county_area_m2
 
 
 # ------------------------------------------------------------
-# 12.7 Discrete sensitivity by reassigned area
+# 12.7 Discrete reassignment sensitivity by reassigned area
 # ------------------------------------------------------------
 
-res_discrete_area <- discrete_reassignment_sensitivity_area(
-  finer_sf         = subcounty_ny_discrete,
-  coarser_sf       = county_ny_discrete,
-  field_rules      = field_rules_discrete,
+res_discrete_reassignment_area <- discrete_reassignment_sensitivity_area(
+  finer_sf         = subcounty_ny_discrete_reassignment,
+  coarser_sf       = county_ny_discrete_reassignment,
+  field_rules      = field_rules_discrete_reassignment,
   n_iterations     = 100,
-  alpha            = discrete_alpha,
+  alpha            = discrete_reassignment_alpha,
   summary_field    = "pop_tol",
   summary_function = summary_moran,
   random_seed      = 123,
@@ -804,23 +882,23 @@ res_discrete_area <- discrete_reassignment_sensitivity_area(
   n_workers        = parallel_workers,
   tol_ratio        = 0.1,
   keep_maps        = FALSE,
-  save_path        = file.path(rds_dir, "fig_discrete_area.rds")
+  save_path        = file.path(rds_dir, "fig_discrete_reassignment_area.rds")
 )
 
 plot_and_save(
-  result_obj      = res_discrete_area,
-  filename_prefix = file.path(fig_dir, "fig_discrete_area")
+  result_obj      = res_discrete_reassignment_area,
+  filename_prefix = file.path(fig_dir, "fig_discrete_reassignment_area")
 )
 
 
 # ------------------------------------------------------------
-# 12.8 Discrete sensitivity by number of reassigned fine regions
+# 12.8 Discrete reassignment sensitivity by number of reassigned fine regions
 # ------------------------------------------------------------
 
-res_discrete_region <- discrete_reassignment_sensitivity_regions(
-  finer_sf         = subcounty_ny_discrete,
-  coarser_sf       = county_ny_discrete,
-  field_rules      = field_rules_discrete,
+res_discrete_reassignment_region <- discrete_reassignment_sensitivity_regions(
+  finer_sf         = subcounty_ny_discrete_reassignment,
+  coarser_sf       = county_ny_discrete_reassignment,
+  field_rules      = field_rules_discrete_reassignment,
   k_regions        = 10,
   n_iterations     = 100,
   summary_function = summary_moran,
@@ -828,12 +906,12 @@ res_discrete_region <- discrete_reassignment_sensitivity_regions(
   random_seed      = 123,
   parallel         = use_parallel,
   n_workers        = parallel_workers,
-  save_path        = file.path(rds_dir, "fig_discrete_region.rds")
+  save_path        = file.path(rds_dir, "fig_discrete_reassignment_region.rds")
 )
 
 plot_and_save(
-  result_obj      = res_discrete_region,
-  filename_prefix = file.path(fig_dir, "fig_discrete_region")
+  result_obj      = res_discrete_reassignment_region,
+  filename_prefix = file.path(fig_dir, "fig_discrete_reassignment_region")
 )
 
 
