@@ -1,10 +1,18 @@
 # On the sensitivities to the modifiable areal unit problem
+# Vector walk-through: population and socio-economic data
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-08-12
+# 2026-08-13
 
-# Please cite the following reference when part or all of the code in this file is reused under the license of CC-BY-4.0:
-# Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit problem. Big Earth Data, 1–36. https://doi.org/10.1080/20964471.2026.2692263
+# Please cite the following reference when part or all of the code in this file
+# is reused under the license of CC-BY-4.0:
+# Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit
+# problem. Big Earth Data, 1–36. https://doi.org/10.1080/20964471.2026.2692263
+
+# When the 'data' folder under the project folder is prepared as required, this
+# script reproduces the figures for example sets I-V in Ye and Chen (2026). 
+# Please note that due to the different randomization seeds, the resulting figures
+# are not exactly the same as the figures in the paper.
 
 # ============================================================
 # 0. Setup
@@ -22,11 +30,12 @@ library(spdep)
 # 0.1 Set project directory and source functions
 # ------------------------------------------------------------
 
-# Set project directory
-project_dir <- "D:/Change_to_your_local_path"
+# Set this to the folder containing this script and the project data folder.
+project_dir <- "Change_to_your_project_directory"
 
-# Source the core sensitivity functions and plotting function
-source(file.path(project_dir, "MAUP sensitivity.R"))
+# Source vector sensitivity functions and shared plotting functions
+source(file.path(project_dir, "MAUP Sensitivity_vector.R"))
+source(file.path(project_dir, "MAUP Sensitivity_plot.R"))
 
 # ------------------------------------------------------------
 # 0.2 Required input folders and files
@@ -50,8 +59,7 @@ source(file.path(project_dir, "MAUP sensitivity.R"))
 # (c) 2023 ACS five-year subject tables
 #     data/ACSST5Y2023.S2701-Data.csv
 #     data/ACSST5Y2023.S0101-Data.csv
-#
-# If the data are stored elsewhere, change the paths in Sections 1 and 2.
+
 
 # ------------------------------------------------------------
 # 0.3 Create output folders
@@ -71,7 +79,7 @@ fig_dir <- file.path(project_dir, "outputs", "figures")
 # Parallel Monte Carlo settings.
 # Set use_parallel <- FALSE if you want the original serial behavior.
 use_parallel <- TRUE
-parallel_workers <- max(1L, parallel::detectCores(logical = TRUE) - 5L)
+parallel_workers <- default_parallel_workers(reserve_cores = 5L)
 
 # ============================================================
 # 1. Load spatial data
@@ -396,9 +404,9 @@ for (fig_id in names(merging_plan)) {
     save_path            = file.path(rds_dir, paste0(fig_id, ".rds"))
   )
   
-  plot_and_save(
-    result_obj      = res,
-    filename_prefix = file.path(fig_dir, fig_id)
+  plot_sensitivity_distribution(
+    result_obj = res,
+    filename   = file.path(fig_dir, paste0(fig_id, ".png"))
   )
 }
 
@@ -491,9 +499,9 @@ for (fig_id in names(splitting_plan)) {
     save_path        = file.path(rds_dir, paste0(fig_id, ".rds"))
   )
   
-  plot_and_save(
-    result_obj      = res,
-    filename_prefix = file.path(fig_dir, fig_id)
+  plot_sensitivity_distribution(
+    result_obj = res,
+    filename   = file.path(fig_dir, paste0(fig_id, ".png"))
   )
 }
 
@@ -563,13 +571,8 @@ saveRDS(
   file.path(rds_dir, "fig_high_order_merging_all_k.rds")
 )
 
-high_order_merging_plots <- plot_and_save(
-  result_obj      = high_order_merging_results,
-  filename_prefix = file.path(fig_dir, "fig_high_order_merging")
-)
-
-combine_sensitivity_plots(
-  plots    = high_order_merging_plots,
+plot_sensitivity_grid(
+  result_obj = high_order_merging_results,
   filename = file.path(fig_dir, "fig_high_order_merging_combined.png"),
   ncol     = 1,
   width    = 7,
@@ -609,13 +612,8 @@ saveRDS(
   file.path(rds_dir, "fig_high_order_splitting_all_k.rds")
 )
 
-high_order_splitting_plots <- plot_and_save(
-  result_obj      = high_order_splitting_results,
-  filename_prefix = file.path(fig_dir, "fig_high_order_splitting")
-)
-
-combine_sensitivity_plots(
-  plots    = high_order_splitting_plots,
+plot_sensitivity_grid(
+  result_obj = high_order_splitting_results,
   filename = file.path(fig_dir, "fig_high_order_splitting_combined.png"),
   ncol     = 1,
   width    = 7,
@@ -732,9 +730,9 @@ for (fig_id in names(continuous_reassignment_plan)) {
     next
   }
   
-  plot_and_save(
-    result_obj      = res,
-    filename_prefix = file.path(fig_dir, fig_id)
+  plot_sensitivity_distribution(
+    result_obj = res,
+    filename   = file.path(fig_dir, paste0(fig_id, ".png"))
   )
 }
 
@@ -888,9 +886,9 @@ res_discrete_reassignment_area <- discrete_reassignment_sensitivity_area(
   save_path        = file.path(rds_dir, "fig_discrete_reassignment_area.rds")
 )
 
-plot_and_save(
-  result_obj      = res_discrete_reassignment_area,
-  filename_prefix = file.path(fig_dir, "fig_discrete_reassignment_area")
+plot_sensitivity_distribution(
+  result_obj = res_discrete_reassignment_area,
+  filename   = file.path(fig_dir, "fig_discrete_reassignment_area.png")
 )
 
 
@@ -912,9 +910,9 @@ res_discrete_reassignment_region <- discrete_reassignment_sensitivity_regions(
   save_path        = file.path(rds_dir, "fig_discrete_reassignment_region.rds")
 )
 
-plot_and_save(
-  result_obj      = res_discrete_reassignment_region,
-  filename_prefix = file.path(fig_dir, "fig_discrete_reassignment_region")
+plot_sensitivity_distribution(
+  result_obj = res_discrete_reassignment_region,
+  filename   = file.path(fig_dir, "fig_discrete_reassignment_region.png")
 )
 
 

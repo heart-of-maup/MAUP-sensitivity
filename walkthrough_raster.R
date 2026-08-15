@@ -1,21 +1,29 @@
 # On the sensitivities to the modifiable areal unit problem
 # Raster walk-through: PRISM precipitation and county zones
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
-# 2026-08-12
+# yexiang@nnu.edu.cn
+# 2026-08-13
 
-# Please cite the following reference when part or all of the code in this file is reused under the license of CC-BY-4.0:
-# Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit problem. Big Earth Data, 1–36. https://doi.org/10.1080/20964471.2026.2692263
+# Please cite the following reference when part or all of the code in this file
+# is reused under the license of CC-BY-4.0:
+# Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit
+# problem. Big Earth Data, 1–36. https://doi.org/10.1080/20964471.2026.2692263
+
+# When the 'data' folder under the project folder is prepared as required, this
+# script reproduces the figures for example sets VI in Ye and Chen (2026). 
+# Please note that due to the different randomization seeds, the resulting figures
+# are not exactly the same as the figures in the paper.
 
 # 13. Setup for raster data processing
 library(terra)
 library(sf)
 
-# Set project directory.
-# Put all raster-related input data under this folder.
-project_dir <- "D:/Change_to_your_local_path"
+# Set this to the folder containing this script and the project data folder.
+project_dir <- "Change_to_your_project_directory"
 
-# Source raster sensitivity functions.
-source(file.path(project_dir, "MAUP sensitivity raster.R"))
+# Source raster sensitivity functions and shared plotting functions.
+source(file.path(project_dir, "MAUP Sensitivity_raster.R"))
+source(file.path(project_dir, "MAUP Sensitivity_plot.R"))
 
 # Parallel Monte Carlo settings.
 # Set use_parallel <- FALSE if you want serial execution.
@@ -26,11 +34,11 @@ parallel_workers <- default_parallel_workers_raster(reserve_cores = 5L)
 #
 # (a) PRISM annual precipitation raster
 #    Put this file here:
-#    D:/MAUP_sen/data/raster_ppt_2023/prism_ppt_us_30s_2023.tif
+#    data/raster_ppt_2023/prism_ppt_us_30s_2023.tif
 #
 # (b) 2023 U.S. county boundary shapefile
 #    Put the full shapefile set here:
-#    D:/MAUP_sen/data/US_county/
+#    data/US_county/
 #
 #    The folder should contain at least:
 #    tl_2023_us_county.shp
@@ -55,13 +63,11 @@ county_shp <- file.path(
 
 # Create output folders.
 output_dir <- file.path(project_dir, "outputs")
-raster_dir <- file.path(output_dir, "raster")
 table_dir <- file.path(output_dir, "tables")
 rds_dir <- file.path(output_dir, "rds")
 fig_dir <- file.path(output_dir, "figures")
 
 dir.create(file.path(project_dir, "outputs"), recursive = TRUE, showWarnings = FALSE)
-dir.create(raster_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(rds_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
@@ -218,7 +224,7 @@ res_raster_merging_k3 <- merging_sensitivity_raster(
   save_path        = file.path(rds_dir, "fig_raster_merging_k1_to_k3.rds")
 )
 
-plot_merging_sensitivity_raster(
+plot_sensitivity_grid(
   result_obj = res_raster_merging_k3,
   filename   = file.path(fig_dir, "fig_raster_merging_k1_to_k3.png"),
   bins       = 50,
@@ -252,7 +258,7 @@ res_raster_splitting_k3 <- splitting_sensitivity_raster(
   save_path        = file.path(rds_dir, "fig_raster_splitting_k1_to_k3.rds")
 )
 
-plot_splitting_sensitivity_raster(
+plot_sensitivity_grid(
   result_obj = res_raster_splitting_k3,
   filename   = file.path(fig_dir, "fig_raster_splitting_k1_to_k3.png"),
   bins       = 50,
@@ -265,8 +271,9 @@ plot_splitting_sensitivity_raster(
 # Manuscript Example set VI: pixel reassignment sensitivity with alpha = 0.2s, 0.5s, and s
 # ============================================================
 
-# Here s is the number of pixels covering the average county size.
-# For each alpha level, alpha_pixels = round(alpha_multiplier * s).
+# Here s_pixels is the average number of pixels per county, alpha_multiplier
+# specifies the reassigned-area scale, and k_pixels is the resulting number of
+# reassigned pixels: k_pixels = round(alpha_multiplier * s_pixels).
 # The county-level precipitation value is recalculated after pixel
 # reassignment, and the summary function is applied to the vector of
 # county-level precipitation values.
@@ -301,13 +308,14 @@ for (fig_id in names(pixel_alpha_plan)) {
   )
 }
 
-plot_pixel_reassignment_grid_raster(
-  result_list = pixel_reassignment_results,
-  filename    = file.path(fig_dir, "fig_raster_pixel_reassignment_alpha_grid.png"),
-  bins        = 50,
-  width       = 7,
-  height      = 16.5,
-  dpi         = 300
+plot_sensitivity_grid(
+  result_obj = pixel_reassignment_results,
+  filename   = file.path(fig_dir, "fig_raster_pixel_reassignment_alpha_grid.png"),
+  bins       = 50,
+  ncol       = 1,
+  width      = 7,
+  height     = 16.5,
+  dpi        = 300
 )
 
 
