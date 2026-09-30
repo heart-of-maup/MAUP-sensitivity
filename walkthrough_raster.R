@@ -7,7 +7,8 @@
 # Please cite the following reference when part or all of the code in this file
 # is reused under the license of CC-BY-4.0:
 # Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit
-# problem. Big Earth Data, 10(3), 1539-1574. https://doi.org/10.1080/20964471.2026.2692263
+# problem. Big Earth Data, 10(3), 1539-1574.
+# https://doi.org/10.1080/20964471.2026.2692263
 
 # When the 'data' folder under the project folder is prepared as required, this
 # script reproduces the figures for example sets VI in Ye and Chen (2026). 
