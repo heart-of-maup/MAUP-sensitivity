@@ -1,6 +1,6 @@
 # On the sensitivities to the modifiable areal unit problem
 This repository contains R scripts that calculate the sensitivities of a geographic observation to the modifiable areal unit problem (MAUP). It accompanies the following paper:
-> Ye, X., & Chen, J. (2026). On the sensitivities to the modifiable areal unit problem. Big Earth Data, 1–36. https://doi.org/10.1080/20964471.2026.2692263
+> Ye, X., and Chen, J. (2026). On the sensitivities to the modifiable areal unit problem. Big Earth Data, 10(3), 1539-1574. doi: 10.1080/20964471.2026.2692263
 
 Both the paper and the code in this repository are openly available. If you use the MAUP sensitivity methods or the accompanying code in your research, please cite the paper above.
 
