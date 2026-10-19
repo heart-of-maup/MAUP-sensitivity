@@ -2,7 +2,7 @@
 # Vector sensitivity calculation functions
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-09-30
+# 2026-10-13
 
 # Please cite the following reference when part or all of the code in this file
 # is reused under the license of CC-BY-4.0:
@@ -12,7 +12,7 @@
 
 # Required packages are checked when the module is sourced. Data import and
 # plotting packages belong to the walkthrough and plotting module, respectively.
-required_vector_packages <- c("sf", "spdep")
+required_vector_packages <- c("sf", "spdep", "igraph")
 missing_vector_packages <- required_vector_packages[
   !vapply(required_vector_packages, requireNamespace, logical(1L), quietly = TRUE)
 ]
@@ -82,127 +82,444 @@ call_summary_function <- function(sf, summary_field, summary_function) {
   do.call(summary_function, unname(args))
 }
 
-default_parallel_workers <- function(reserve_cores = 1L) {
-  # Choose a conservative number of parallel workers while leaving cores free
-  # for the operating system and other tasks.
-  
-  n_cores <- parallel::detectCores(logical = TRUE)
-  
-  if (is.na(n_cores) || n_cores < 2L) {
-    return(1L)
+default_parallel_workers <- function(reserve_cores = 10L) {
+  # Choose a worker count from the detected logical cores, leaving the
+  # requested number free. Fall back to one worker if detection is unavailable.
+
+  if (!is.numeric(reserve_cores) || length(reserve_cores) != 1L ||
+      !is.finite(reserve_cores) || reserve_cores < 0 ||
+      reserve_cores != floor(reserve_cores)) {
+    stop("reserve_cores must be one non-negative integer")
   }
-  
-  max(1L, n_cores - reserve_cores)
+  cores <- parallel::detectCores(logical = TRUE)
+  if (is.na(cores) || cores < 2L) return(1L)
+  as.integer(max(1, cores - reserve_cores))
+}
+
+restore_monte_carlo_rng <- function(kind, seed, had_seed) {
+  # Restore the calling process's random-number settings after seeded work.
+  # kind stores RNGkind(); seed is the previous .Random.seed. Restore the
+  # generator first, since changing it can also change the random state.
+  do.call(RNGkind, as.list(kind))
+  if (had_seed) {
+    assign(".Random.seed", seed, envir = .GlobalEnv)
+  } else if (exists(".Random.seed", .GlobalEnv, inherits = FALSE)) {
+    # No state existed before the operation: remove the newly created one.
+    rm(".Random.seed", envir = .GlobalEnv)
+  }
+}
+
+# -- Monte Carlo execution lifecycle -----------------------------------------
+# Create a record -> submit batches with run_monte_carlo -> close the record.
+# Workers start only when needed. The sensitivity algorithm, not these
+# helpers, decides which paths are valid and whether to submit more tasks.
+
+create_monte_carlo_executor <- function(FUN,
+                                        parallel = FALSE,
+                                        n_workers = default_parallel_workers(),
+                                        random_seed = NULL,
+                                        export_names = character(),
+                                        export_env = .GlobalEnv,
+                                        packages = c("sf", "spdep"),
+                                        progress_label = "Monte Carlo") {
+  # Prepare a reusable record containing the task and its execution settings.
+  # FUN performs one complete simulation; this function does not run it or
+  # start worker processes. The returned environment is reused across batches.
+
+  # -- Validate the execution configuration --------------------------------
+  if (!is.function(FUN)) stop("FUN must be a function")
+  if (!is.logical(parallel) || length(parallel) != 1L || is.na(parallel)) {
+    stop("parallel must be TRUE or FALSE")
+  }
+  if (!is.numeric(n_workers) || length(n_workers) != 1L ||
+      !is.finite(n_workers) || n_workers < 1 || n_workers != floor(n_workers) ||
+      n_workers > .Machine$integer.max) {
+    stop("n_workers must be one positive integer")
+  }
+  if (!is.null(random_seed) &&
+      (!is.numeric(random_seed) || length(random_seed) != 1L ||
+       !is.finite(random_seed) || random_seed < 0 ||
+       random_seed != floor(random_seed) || random_seed > .Machine$integer.max)) {
+    stop("random_seed must be NULL or one non-negative integer")
+  }
+  for (name in c("export_names", "packages")) {
+    value <- get(name)
+    if (!is.character(value) || anyNA(value) || any(!nzchar(value))) {
+      stop(sprintf("%s must be a character vector of non-empty names", name))
+    }
+  }
+  if (!is.environment(export_env)) stop("export_env must be an environment")
+  if (!is.character(progress_label) || length(progress_label) != 1L ||
+      is.na(progress_label) || !nzchar(progress_label)) {
+    stop("progress_label must be one non-empty string")
+  }
+
+  # -- Resolve dependencies before starting workers ------------------------
+  # Vector tasks use sf and spdep by default. Callers can add other
+  # dependencies, such as lwgeom for polygon splitting.
+  packages <- unique(packages)
+  missing_packages <- packages[
+    !vapply(packages, requireNamespace, logical(1L), quietly = TRUE)
+  ]
+  if (length(missing_packages)) {
+    stop(sprintf("Missing requested package(s): %s", paste(missing_packages, collapse = ", ")))
+  }
+  # Look up the named helper functions or data in export_env and its parents.
+  # Workers will receive these values under the same names.
+  export_names <- unique(export_names)
+  values <- setNames(lapply(export_names, function(name) {
+    if (!exists(name, envir = export_env, inherits = TRUE)) {
+      stop(sprintf("Export object '%s' was not found", name))
+    }
+    get(name, envir = export_env, inherits = TRUE)
+  }), export_names)
+
+  # -- Capture the task before adding live worker connections ---------------
+  # Serializing and reading back copies local function environments and
+  # exported objects into a snapshot for worker initialisation.
+  # Freeze local closure environments before the caller stores this executor
+  # beside FUN. Only this snapshot is sent to workers, once per pool.
+  frozen <- unserialize(serialize(list(FUN = FUN, exports = values), NULL))
+  # An environment is updated by reference, so later batches see the same
+  # connections, submitted-task count and next random stream.
+  executor <- new.env(parent = emptyenv())
+  class(executor) <- "monte_carlo_executor"
+  # Keep the original settings to detect conflicting arguments on reuse.
+  executor$config <- list(FUN = FUN, parallel = parallel, n_workers = n_workers,
+                          random_seed = random_seed, export_names = export_names,
+                          export_env = export_env, packages = packages,
+                          progress_label = progress_label)
+  executor$FUN <- frozen$FUN
+  executor$exports <- frozen$exports
+  # Mutable state: cluster stores worker connections; closed blocks reuse
+  # after shutdown; n_submitted counts tasks across batches; next_seed holds
+  # the next task's RNG state (NULL means no explicit stream is assigned).
+  executor$cluster <- NULL
+  executor$closed <- FALSE
+  executor$n_submitted <- 0
+  executor$next_seed <- NULL
+
+  # -- Prepare the first task's random stream ------------------------------
+  # L'Ecuyer-CMRG supports separate streams for successive tasks. Preserve
+  # the caller's RNG settings with on.exit(), including on an early error.
+  if (!is.null(random_seed)) {
+    kind <- RNGkind()
+    had_seed <- exists(".Random.seed", .GlobalEnv, inherits = FALSE)
+    seed <- if (had_seed) get(".Random.seed", .GlobalEnv) else NULL
+    on.exit(restore_monte_carlo_rng(kind, seed, had_seed), add = TRUE)
+    RNGkind("L'Ecuyer-CMRG")
+    set.seed(as.integer(random_seed))
+    executor$next_seed <- get(".Random.seed", .GlobalEnv)
+  }
+  executor
+}
+
+close_monte_carlo_executor <- function(executor) {
+  # Release the worker processes. The creator registers this with on.exit()
+  # so normal completion and errors both trigger cleanup.
+
+  if (!inherits(executor, "monte_carlo_executor") || !is.environment(executor)) {
+    stop("executor must be a Monte Carlo executor")
+  }
+  # Repeated cleanup is harmless. Mark the executor closed before shutdown
+  # so later submissions cannot reuse these connections.
+  if (executor$closed) return(invisible(NULL))
+  executor$closed <- TRUE
+  cl <- executor$cluster
+  executor$cluster <- NULL
+  # A broken connection can also fail during cleanup. Do not let that
+  # secondary error hide the error that originally ended the calculation.
+  if (!is.null(cl)) tryCatch(parallel::stopCluster(cl), error = function(e) NULL)
+  invisible(NULL)
+}
+
+start_monte_carlo_workers <- function(executor, n_tasks) {
+  # Start a PSOCK pool when a batch needs parallel execution. Reuse an
+  # existing pool without resending its task function and dependencies.
+
+  # -- Reuse the existing pool or leave execution serial -------------------
+  if (!is.null(executor$cluster) || !executor$config$parallel ||
+      executor$config$n_workers <= 1L || n_tasks <= 1L) return(invisible(NULL))
+
+  # -- Launch independent R processes -------------------------------------
+  # Cap the initial process count at the number of submitted tasks.
+  cl <- parallel::makePSOCKcluster(min(executor$config$n_workers, n_tasks))
+  # Until initialisation succeeds, this function owns cleanup of the new
+  # pool. Afterwards, the executor's creator is responsible for closing it.
+  initialized <- FALSE
+  on.exit(if (!initialized) {
+    tryCatch(parallel::stopCluster(cl), error = function(e) NULL)
+  }, add = TRUE)
+
+  # -- Initialise each worker once ----------------------------------------
+  # This function runs inside each worker: .GlobalEnv below belongs to that
+  # worker, where the packages, exported objects and task function are kept.
+  initialize <- function(FUN, exports, packages) {
+    for (pkg in packages) {
+      if (!requireNamespace(pkg, quietly = TRUE)) {
+        stop(sprintf("Missing requested worker package: %s", pkg))
+      }
+      suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    }
+    list2env(exports, envir = .GlobalEnv)
+    assign(".maup_monte_carlo_FUN", FUN, envir = .GlobalEnv)
+    NULL
+  }
+  # Only base functions and explicit arguments are needed. Using baseenv()
+  # avoids sending this function's enclosing coordinator environment.
+  environment(initialize) <- baseenv()
+  # clusterCall runs the same initialisation on every worker in the pool.
+  parallel::clusterCall(cl, initialize, executor$FUN, executor$exports,
+                        executor$config$packages)
+  executor$cluster <- cl
+  initialized <- TRUE
+  invisible(NULL)
+}
+
+dispatch_monte_carlo_task <- function(task, FUN = NULL) {
+  # Execute one complete simulation. task contains value (the argument for
+  # FUN), ordinal (its submission number across batches), and seed (its
+  # assigned random stream, or NULL). Serial calls supply FUN directly;
+  # parallel calls retrieve the function previously installed on the worker.
+
+  # This function's environment is reset to baseenv before dispatch: no
+  # coordinator, executor, or cluster is serialized with individual tasks.
+  if (is.null(FUN)) FUN <- get(".maup_monte_carlo_FUN", envir = .GlobalEnv)
+  # Select this task's stream independently of which worker receives it.
+  if (!is.null(task$seed)) assign(".Random.seed", task$seed, envir = .GlobalEnv)
+  # ok indicates whether FUN returned normally, not whether a simulated
+  # path is valid. A returned list(error = ...) is kept as a normal value;
+  # only an uncaught R error is wrapped with ok = FALSE and the task number.
+  tryCatch(list(ok = TRUE, value = FUN(task$value)),
+           error = function(e) list(ok = FALSE, ordinal = task$ordinal,
+                                    message = conditionMessage(e)))
 }
 
 run_monte_carlo <- function(X,
                             FUN,
-                            parallel  = FALSE,
+                            parallel = FALSE,
                             n_workers = default_parallel_workers(),
                             random_seed = NULL,
                             export_names = character(0),
                             export_env = .GlobalEnv,
-                            progress_label = "Monte Carlo") {
-  # Run a Monte-Carlo job either serially or with a temporary PSOCK cluster.
-  # This wrapper keeps random seeding and worker setup consistent.
+                            progress_label = "Monte Carlo",
+                            executor = NULL,
+                            progress = TRUE,
+                            chunk_size = NULL,
+                            packages = c("sf", "spdep")) {
+  # Execute one submission of independent tasks and return a list in input
+  # order. Each element of X is passed to FUN; no results are filtered here.
 
-  if (!is.function(FUN)) {
-    stop("FUN must be a function")
+  # -- Validate controls for this submission -------------------------------
+  if (!is.logical(progress) || length(progress) != 1L || is.na(progress)) {
+    stop("progress must be TRUE or FALSE")
+  }
+  if (!is.null(chunk_size) &&
+      (!is.numeric(chunk_size) || length(chunk_size) != 1L ||
+       !is.finite(chunk_size) || chunk_size < 1 ||
+       chunk_size != floor(chunk_size) || chunk_size > .Machine$integer.max)) {
+    stop("chunk_size must be NULL or one positive integer")
   }
 
-  if (!is.logical(parallel) || length(parallel) != 1L || is.na(parallel)) {
-    stop("parallel must be TRUE or FALSE")
-  }
-
-  if (!is.null(random_seed)) {
-    if (!is.numeric(random_seed) || length(random_seed) != 1L ||
-        !is.finite(random_seed) || random_seed < 0 ||
-        random_seed != floor(random_seed) ||
-        random_seed > .Machine$integer.max) {
-      stop("random_seed must be NULL or one non-negative integer")
+  # -- Create a temporary executor or borrow an existing one ---------------
+  # Only an executor created here is closed on return. When reusing one
+  # across retry batches, the calling sensitivity function owns cleanup.
+  owned <- is.null(executor)
+  if (owned) {
+    if (missing(FUN)) stop("FUN must be provided when executor is NULL")
+    executor <- create_monte_carlo_executor(
+      FUN, parallel, n_workers, random_seed, export_names, export_env,
+      packages, progress_label
+    )
+    on.exit(close_monte_carlo_executor(executor), add = TRUE)
+  } else {
+    if (!inherits(executor, "monte_carlo_executor") || !is.environment(executor)) {
+      stop("executor must be a Monte Carlo executor")
     }
-    random_seed <- as.integer(random_seed)
-  }
-
-  if (length(X) == 0L) {
-    return(list())
-  }
-
-  run_serial <- function() {
-    if (!is.null(random_seed)) {
-      set.seed(random_seed)
+    # Explicit configuration is allowed only when it matches this session.
+    # Inspect explicitly supplied arguments only: omitted defaults must not
+    # overwrite the settings recorded when this executor was created.
+    supplied <- as.list(match.call(expand.dots = FALSE))[-1L]
+    config_names <- intersect(names(supplied), names(executor$config))
+    for (name in config_names) {
+      value <- get(name)
+      expected <- executor$config[[name]]
+      same <- if (name %in% c("n_workers", "random_seed")) {
+        isTRUE(all.equal(value, expected))
+      } else identical(value, expected)
+      if (!same) stop(sprintf("'%s' conflicts with the supplied executor", name))
     }
-    lapply(X, FUN)
+  }
+  if (executor$closed) stop("Cannot submit tasks to a closed executor")
+  if (!length(X)) return(setNames(vector("list", 0L), names(X)))
+
+  # -- Preserve the caller's random-number settings ------------------------
+  # Explicit seeds never alter the caller's RNG state, including on errors.
+  if (!is.null(executor$config$random_seed)) {
+    kind <- RNGkind()
+    had_seed <- exists(".Random.seed", .GlobalEnv, inherits = FALSE)
+    seed <- if (had_seed) get(".Random.seed", .GlobalEnv) else NULL
+    on.exit(restore_monte_carlo_rng(kind, seed, had_seed), add = TRUE)
   }
 
-  if (!isTRUE(parallel)) {
-    return(run_serial())
-  }
-
-  if (!is.numeric(n_workers) || length(n_workers) != 1L ||
-      !is.finite(n_workers) || n_workers < 1L ||
-      n_workers != floor(n_workers)) {
-    stop("n_workers must be one positive integer")
-  }
-
-  n_workers <- as.integer(n_workers)
-  n_workers <- max(1L, min(n_workers, length(X)))
-
-  if (n_workers <= 1L || length(X) <= 1L) {
-    message(sprintf(
-      "%s: one worker/task available; using serial execution",
-      progress_label
-    ))
-    return(run_serial())
-  }
-  
-  message(sprintf(
-    "%s: using %d parallel workers for %d iterations",
-    progress_label, n_workers, length(X)
-  ))
-  
-  cl <- parallel::makeCluster(n_workers)
-  on.exit(parallel::stopCluster(cl), add = TRUE)
-  
-  if (!is.null(random_seed)) {
-    parallel::clusterSetRNGStream(cl, random_seed)
-  }
-  
-  parallel::clusterEvalQ(cl, {
-    for (pkg in c("sf", "lwgeom", "spdep")) {
-      if (requireNamespace(pkg, quietly = TRUE)) {
-        suppressPackageStartupMessages(
-          library(pkg, character.only = TRUE)
-        )
-      }
+  # -- Start workers if needed, then prepare tasks and random streams -------
+  start_monte_carlo_workers(executor, length(X))
+  # Number tasks and assign streams before dispatch. next_seed persists
+  # across submissions, so a retry batch continues instead of restarting.
+  tasks <- lapply(seq_along(X), function(i) {
+    task <- list(value = X[[i]], ordinal = executor$n_submitted + i,
+                 seed = executor$next_seed)
+    if (!is.null(executor$next_seed)) {
+      executor$next_seed <- parallel::nextRNGStream(executor$next_seed)
     }
-    NULL
+    task
   })
-  
-  export_names <- unique(as.character(export_names))
-  export_names <- export_names[nzchar(export_names)]
-  if (length(export_names) > 0L) {
-    parallel::clusterExport(cl, export_names, envir = export_env)
+  # This counts submitted tasks, including simulations that may later fail.
+  executor$n_submitted <- executor$n_submitted + length(X)
+
+  # -- Group tasks for progress reporting ---------------------------------
+  # Aim for roughly ten updates, with at least one task per worker in each
+  # full batch by default. The last batch may contain fewer tasks.
+  if (is.null(chunk_size)) {
+    workers <- if (is.null(executor$cluster)) 1L else length(executor$cluster)
+    chunk_size <- max(workers, ceiling(length(X) / 10))
   }
-  
-  # Run parallel jobs in batches so the main process can report progress
-  # instead of staying silent until every worker finishes.
-  batch_size <- max(n_workers, ceiling(length(X) / 10))
-  batch_ids <- split(seq_along(X), ceiling(seq_along(X) / batch_size))
-  results <- vector("list", length(X))
-  
-  for (batch in batch_ids) {
-    batch_results <- parallel::parLapply(cl, X[batch], FUN)
-    results[batch] <- batch_results
-    
-    n_done <- max(batch)
-    message(sprintf(
-      "%s: completed %d/%d iterations",
-      progress_label, n_done, length(X)
-    ))
+  batches <- split(seq_along(X), ceiling(seq_along(X) / chunk_size))
+  results <- setNames(vector("list", length(X)), names(X))
+  dispatch <- dispatch_monte_carlo_task
+  environment(dispatch) <- baseenv()
+
+  # -- Execute batches and collect results --------------------------------
+  # parLapply distributes one batch across workers and waits for all replies
+  # before the next batch. lapply executes in the current R process.
+  for (batch in batches) {
+    replies <- if (is.null(executor$cluster)) {
+      lapply(tasks[batch], function(task) dispatch(task, FUN = executor$FUN))
+    } else {
+      parallel::parLapply(executor$cluster, tasks[batch], dispatch)
+    }
+    for (j in seq_along(batch)) {
+      reply <- replies[[j]]
+      if (!reply$ok) {
+        stop(sprintf("Monte Carlo task %s failed: %s", reply$ordinal, reply$message),
+             call. = FALSE)
+      }
+      # Preserve NULL as a list entry instead of deleting its position.
+      results[batch[j]] <- list(reply$value)
+    }
+    if (progress) message(sprintf("%s: completed %d/%d iterations",
+                                  executor$config$progress_label, max(batch), length(X)))
   }
-  
   results
+}
+
+
+validate_monte_carlo_sample_count <- function(n_iterations) {
+  if (!is.numeric(n_iterations) || length(n_iterations) != 1L ||
+      !is.finite(n_iterations) || n_iterations < 1 ||
+      n_iterations != floor(n_iterations) || n_iterations > .Machine$integer.max) {
+    stop("n_iterations must be one positive integer")
+  }
+  as.integer(n_iterations)
+}
+
+is_finite_monte_carlo_statistic <- function(value) {
+  is.numeric(value) && length(value) == 1L && is.finite(value)
+}
+
+is_valid_monte_carlo_path <- function(value, k_order) {
+  # A sample is one complete path, not one row of a k-order result table.
+  is.data.frame(value) && nrow(value) == k_order &&
+    all(c("k", "summary_value") %in% names(value)) &&
+    identical(as.integer(value$k), seq_len(k_order)) &&
+    is.numeric(value$summary_value) && all(is.finite(value$summary_value)) &&
+    (!"status" %in% names(value) ||
+       all(!is.na(value$status) & value$status == "Success"))
+}
+
+collect_valid_monte_carlo <- function(FUN, n_iterations, valid_result,
+                                      parallel = FALSE,
+                                      n_workers = default_parallel_workers(),
+                                      random_seed = NULL,
+                                      export_names = character(),
+                                      export_env = .GlobalEnv,
+                                      progress_label = "Monte Carlo",
+                                      max_attempts = NULL,
+                                      packages = c("sf", "spdep")) {
+  # Retain exactly the requested number of valid samples or raise an error.
+  # Simulated failures are rejected; executor/connection errors still abort.
+  n_iterations <- validate_monte_carlo_sample_count(n_iterations)
+  if (!is.function(FUN) || !is.function(valid_result)) {
+    stop("FUN and valid_result must be functions")
+  }
+  if (is.null(max_attempts)) {
+    max_attempts <- min(.Machine$integer.max,
+                        max(10 * n_iterations, n_iterations + 1000))
+  }
+  if (!is.numeric(max_attempts) || length(max_attempts) != 1L ||
+      !is.finite(max_attempts) || max_attempts < n_iterations ||
+      max_attempts != floor(max_attempts) || max_attempts > .Machine$integer.max) {
+    stop("max_attempts must be one integer >= n_iterations")
+  }
+
+  # Freeze only the task closure in a small environment before creating a pool.
+  safe_task <- function(i) {
+    tryCatch(.task_function(i), error = function(e) {
+      list(error = sprintf("Attempt %s failed: %s", i, conditionMessage(e)))
+    })
+  }
+  task_env <- new.env(parent = baseenv())
+  task_env$.task_function <- FUN
+  environment(safe_task) <- task_env
+  executor <- create_monte_carlo_executor(
+    FUN = safe_task, parallel = parallel, n_workers = n_workers,
+    random_seed = random_seed, export_names = export_names,
+    export_env = export_env, packages = packages, progress_label = progress_label
+  )
+  on.exit(close_monte_carlo_executor(executor), add = TRUE)
+
+  # Submit at most the remaining quota: there can be no excess valid samples.
+  # Batch sizes do not depend on worker count; streams continue across retries.
+  selected <- list()
+  attempt_batches <- list()
+  failure_reasons <- character()
+  attempts <- 0
+  while (length(selected) < n_iterations && attempts < max_attempts) {
+    size <- min(n_iterations - length(selected), max_attempts - attempts)
+    ids <- attempts + seq_len(size)
+    batch <- run_monte_carlo(ids, executor = executor, progress = TRUE)
+    accepted <- vapply(batch, function(x) isTRUE(valid_result(x)), logical(1L))
+    selected <- c(selected, batch[accepted])
+    attempt_batches[[length(attempt_batches) + 1L]] <- batch
+    for (x in batch[!accepted]) {
+      reason <- if (is.list(x) && !is.null(x$error)) {
+        as.character(x$error)[1L]
+      } else if (is.data.frame(x) && "termination_reason" %in% names(x) &&
+                 any(!is.na(x$termination_reason))) {
+        paste(unique(x$termination_reason), collapse = ", ")
+      } else {
+        "Incomplete simulation path or non-finite statistic"
+      }
+      failure_reasons <- c(failure_reasons, reason)
+    }
+    attempts <- attempts + size
+    message(sprintf("%s: %d/%d valid samples, %d/%d attempts",
+                    progress_label, length(selected), n_iterations,
+                    attempts, max_attempts))
+  }
+  if (length(selected) < n_iterations) {
+    examples <- paste(utils::head(unique(failure_reasons), 3L), collapse = "; ")
+    condition <- structure(list(
+      message = sprintf("%s: maximum attempts reached (%d); collected %d/%d valid samples. %s",
+                        progress_label, attempts, length(selected), n_iterations, examples),
+      call = NULL, requested_iterations = n_iterations,
+      valid_samples = length(selected), total_attempts = attempts,
+      max_attempts = max_attempts, failure_reasons = unique(failure_reasons)
+    ), class = c("maup_sample_limit_error", "error", "condition"))
+    stop(condition)
+  }
+  list(results = selected, attempts = do.call(c, attempt_batches),
+       total_attempts = attempts, max_attempts = max_attempts)
 }
 
 summary_function_export_names <- function(summary_function) {
@@ -228,19 +545,19 @@ merging_operation <- function(sf, i, j, field_rules) {
   # Merge two areal units and recalculate their attributes according to
   # the user-supplied field rules.
   
-  # ── Locate target row indices ─────────────────────────────────────────────
+  # -- Locate target row indices ---------------------------------------------
   idx_i <- which(sf$ID == i)
   idx_j <- which(sf$ID == j)
   
   if (length(idx_i) == 0) stop(sprintf("ID '%s' does not exist in the sf object", i))
   if (length(idx_j) == 0) stop(sprintf("ID '%s' does not exist in the sf object", j))
   
-  # ── Compute areas of the two units (used for the area_weighted rule) ──────
+  # -- Compute areas of the two units (used for the area_weighted rule) ------
   area_i     <- as.numeric(st_area(sf[idx_i, ]))
   area_j     <- as.numeric(st_area(sf[idx_j, ]))
   total_area <- area_i + area_j
   
-  # ── Merge geometries; new ID is current max + 1 ───────────────────────────
+  # -- Merge geometries; new ID is current max + 1 ---------------------------
   merged_geom <- st_union(sf$geometry[c(idx_i, idx_j)])
   new_id      <- max(sf$ID, na.rm = TRUE) + 1L
   
@@ -251,7 +568,7 @@ merging_operation <- function(sf, i, j, field_rules) {
   
   if (!is.null(field_rules)) {
     
-    # ── Step 1: handle all basic rules (sum / area_weighted / reserve) ──────
+    # -- Step 1: handle all basic rules (sum / area_weighted / reserve) ------
     for (field_name in names(field_rules)) {
       rule <- field_rules[[field_name]]$merge
       if (is.list(rule)) next
@@ -267,7 +584,7 @@ merging_operation <- function(sf, i, j, field_rules) {
       )
     }
     
-    # ── Step 2: recompute derived fields using the updated count fields ─────
+    # -- Step 2: recompute derived fields using the updated count fields -----
     for (field_name in names(field_rules)) {
       rule <- field_rules[[field_name]]$merge
       if (!is.list(rule)) next
@@ -287,7 +604,7 @@ merging_operation <- function(sf, i, j, field_rules) {
     }
   }
   
-  # ── Remove the two original rows and append the merged new row ────────────
+  # -- Remove the two original rows and append the merged new row ------------
   rbind(sf[-c(idx_i, idx_j), ], new_row)
 }
 
@@ -408,25 +725,27 @@ merging_sensitivity <- function(sf,
                                 n_simulations        = 200,
                                 parallel             = FALSE,
                                 n_workers            = default_parallel_workers(),
-                                save_path            = NULL) {
+                                save_path            = NULL,
+                                max_attempts = NULL) {
+  n_iterations <- validate_monte_carlo_sample_count(n_iterations)
   # Estimate how much a summary statistic changes after k sequential merges.
   # Small candidate spaces are enumerated; larger ones are sampled randomly.
   
-  # ── Input validation ──────────────────────────────────────────────────────
+  # -- Input validation ------------------------------------------------------
   if (!is.function(summary_function))         stop("summary_function must be a function")
   summary_field <- validate_summary_fields(sf, summary_field)
   if (k_order < 1)                            stop("k_order must be >= 1")
   
   if (!is.null(random_seed)) set.seed(random_seed)
   
-  # ── Compute baseline statistic ────────────────────────────────────────────
+  # -- Compute baseline statistic --------------------------------------------
   origin_value <- tryCatch({
     call_summary_function(sf, summary_field, summary_function)
   }, error = function(e) {
     stop(paste0("summary_function failed on the initial data: ", e$message))
   })
   
-  # ── Estimate the number of combinations to decide exhaustive vs sampling ──
+  # -- Estimate the number of combinations to decide exhaustive vs sampling --
   message("Estimating the complexity of k-order merging...")
   complexity_results     <- calculate_merge_complexity(sf, n_simulations = n_simulations)
   target_complexity      <- complexity_results[complexity_results$k_order == k_order, ]
@@ -437,7 +756,7 @@ merging_sensitivity <- function(sf,
   use_exhaustive  <- estimated_combinations <= exhaustive_threshold
   analysis_method <- if (use_exhaustive) "exhaustive" else "random_sampling"
   
-  # ── Exhaustively enumerate all possible k-step merge paths ────────────────
+  # -- Exhaustively enumerate all possible k-step merge paths ----------------
   exhaustive_merging <- function() {
     # Enumerate every valid k-step merge path and store each step's statistic.
     
@@ -534,7 +853,7 @@ merging_sensitivity <- function(sf,
     return(all_results)
   }
   
-  # ── Randomly sample n_iterations k-step merge paths ───────────────────────
+  # -- Randomly sample n_iterations k-step merge paths -----------------------
   random_merging <- function() {
     # Sample k-step merge paths when exhaustive enumeration is too expensive.
     
@@ -619,19 +938,22 @@ merging_sensitivity <- function(sf,
       do.call(rbind, iter_rows)
     }
     
-    iter_results <- run_monte_carlo(
-      X              = seq_len(n_iterations),
+    sampled <- collect_valid_monte_carlo(
+      n_iterations = n_iterations,
       FUN            = run_one_merge_path,
       parallel       = parallel,
       n_workers      = n_workers,
       random_seed    = random_seed,
       export_names   = summary_function_export_names(summary_function),
       export_env     = environment(summary_function),
-      progress_label = "Merging sensitivity"
+      progress_label = "Merging sensitivity",
+      valid_result = function(x) is_valid_monte_carlo_path(x, k_order),
+      max_attempts = max_attempts
     )
+    iter_results <- sampled$results
     
     error_messages <- vapply(
-      Filter(function(x) is.list(x) && !is.null(x$error), iter_results),
+      Filter(function(x) is.list(x) && !is.null(x$error), sampled$attempts),
       function(x) x$error,
       character(1)
     )
@@ -661,7 +983,7 @@ merging_sensitivity <- function(sf,
     return(results)
   }
   
-  # ── Run the analysis ──────────────────────────────────────────────────────
+  # -- Run the analysis ------------------------------------------------------
   if (use_exhaustive) {
     message(sprintf("Combination count (%.2e) is below the threshold (%.2e); using exhaustive method",
                     estimated_combinations, exhaustive_threshold))
@@ -675,7 +997,7 @@ merging_sensitivity <- function(sf,
     distribution <- random_merging()
   }
   
-  # ── Assemble the final result object ──────────────────────────────────────
+  # -- Assemble the final result object --------------------------------------
   result <- list(
     origin_value    = origin_value,
     k_order         = k_order,
@@ -683,7 +1005,7 @@ merging_sensitivity <- function(sf,
     distribution    = distribution
   )
   
-  # ── Save the result as an .rds file ───────────────────────────────────────
+  # -- Save the result as an .rds file ---------------------------------------
   if (is.null(save_path)) {
     save_path <- sprintf("merging_sensitivity_k%d_%s_%s.rds",
                          k_order,
@@ -803,7 +1125,7 @@ splitting_operation <- function(
     
     if (!is.null(field_rules)) {
       
-      # ── Step 1: handle simple-rule fields ─────────────────────────────
+      # -- Step 1: handle simple-rule fields -----------------------------
       # Simple rules: split value is a string ("area_weighted" or "keep").
       # These must be processed before derived fields, because derived
       # fields rely on the values produced in this step.
@@ -822,7 +1144,7 @@ splitting_operation <- function(
         )
       }
       
-      # ── Step 2: handle derived fields ─────────────────────────────────
+      # -- Step 2: handle derived fields ---------------------------------
       # Derived fields: split value is a list with `numerator` and
       # `denominator` sub-fields. Ratio-type fields (e.g. percentages)
       # cannot be split directly by area; they must be recomputed from
@@ -872,16 +1194,18 @@ splitting_sensitivity <- function(sf,
                                   random_seed  = NULL,
                                   parallel     = FALSE,
                                   n_workers    = default_parallel_workers(),
-                                  save_path    = NULL) {
+                                  save_path    = NULL,
+                                  max_attempts = NULL) {
+  n_iterations <- validate_monte_carlo_sample_count(n_iterations)
   # Estimate how much a summary statistic changes after k sequential splits.
   # Split paths are sampled randomly because the search space is very large.
   
-  # ── Input validation ──────────────────────────────────────────────────────
+  # -- Input validation ------------------------------------------------------
   if (!is.function(summary_function))   stop("summary_function must be a function")
   summary_field <- validate_summary_fields(sf, summary_field)
   if (k_order < 1)                      stop("k_order must be >= 1")
   
-  # ── Compute baseline statistic ────────────────────────────────────────────
+  # -- Compute baseline statistic --------------------------------------------
   # Record the statistic on the original data as a reference baseline before
   # any split operation is performed
   origin_value <- tryCatch({
@@ -890,7 +1214,7 @@ splitting_sensitivity <- function(sf,
     stop(paste0("summary_function failed on the initial data: ", e$message))
   })
   
-  # ── Random sampling ───────────────────────────────────────────────────────
+  # -- Random sampling -------------------------------------------------------
   # The number of possible split paths is huge (the candidate count grows
   # rapidly with k), so we do not enumerate exhaustively and always rely on
   # random sampling. n_iterations is the target number of *successful* paths,
@@ -909,12 +1233,6 @@ splitting_sensitivity <- function(sf,
     stringsAsFactors = FALSE
   )
   
-  successful   <- 0L
-  attempts     <- 0L
-  error_messages <- character(0)
-  # Cap the total number of attempts to prevent infinite loops when split
-  # conditions are very restrictive
-  max_attempts <- max(n_iterations * 10L, n_iterations + 1000L)
   
   field_rules_local      <- field_rules
   summary_field_local    <- summary_field
@@ -1000,99 +1318,30 @@ splitting_sensitivity <- function(sf,
     do.call(rbind, iter_rows)
   }
 
-  valid_results <- list()
+  sampled <- collect_valid_monte_carlo(
+    FUN = run_one_split_attempt, n_iterations = n_iterations,
+    valid_result = function(x) is_valid_monte_carlo_path(x, k_order),
+    parallel = parallel, n_workers = n_workers, random_seed = random_seed,
+    export_names = summary_function_export_names(summary_function),
+    export_env = environment(summary_function), packages = c("sf", "spdep", "lwgeom"),
+    progress_label = "Splitting sensitivity", max_attempts = max_attempts
+  )
+  selected <- Map(function(df, path_id) {
+    df$path_id <- path_id
+    df
+  }, sampled$results, seq_len(n_iterations))
+  results <- do.call(rbind, selected)
+  message(sprintf("Random sampling finished: %d valid paths, %d total attempts",
+                  n_iterations, sampled$total_attempts))
 
-  while (successful < n_iterations && attempts < max_attempts) {
-    remaining_successes <- n_iterations - successful
-
-    # Preserve the existing execution strategies: serial mode submits one
-    # attempt at a time, while parallel mode oversamples candidate attempts
-    # to compensate for failed paths.
-    batch_size <- if (isTRUE(parallel)) {
-      min(
-        max(remaining_successes * 2L, n_workers),
-        max_attempts - attempts
-      )
-    } else {
-      1L
-    }
-
-    batch_ids  <- attempts + seq_len(batch_size)
-    batch_seed <- if (is.null(random_seed)) NULL else random_seed + attempts
-
-    attempt_results <- run_monte_carlo(
-      X              = batch_ids,
-      FUN            = run_one_split_attempt,
-      parallel       = parallel,
-      n_workers      = n_workers,
-      random_seed    = batch_seed,
-      export_names   = summary_function_export_names(summary_function),
-      export_env     = environment(summary_function),
-      progress_label = "Splitting sensitivity"
-    )
-
-    batch_errors <- vapply(
-      Filter(function(x) is.list(x) && !is.null(x$error), attempt_results),
-      function(x) x$error,
-      character(1)
-    )
-    if (length(batch_errors) > 0L) {
-      error_messages <- c(error_messages, batch_errors)
-    }
-
-    batch_valid <- Filter(is.data.frame, attempt_results)
-    if (length(batch_valid) > 0L) {
-      valid_results <- c(valid_results, batch_valid)
-    }
-
-    attempts   <- attempts + batch_size
-    successful <- min(length(valid_results), n_iterations)
-
-    if (!isTRUE(parallel) && length(batch_valid) > 0L &&
-        successful > 0L && successful %% 10L == 0L) {
-      message(sprintf(
-        "Successfully completed %d/%d (total attempts: %d)",
-        successful, n_iterations, attempts
-      ))
-    }
-  }
-
-  if (successful > 0L) {
-    selected <- valid_results[seq_len(successful)]
-    selected <- Map(function(df, path_id) {
-      df$path_id <- path_id
-      df
-    }, selected, seq_len(successful))
-    results <- do.call(rbind, selected)
-  }
-  
-  # If the attempt cap is reached without meeting the target, raise a clear
-  # warning rather than silently returning a deficient result
-  if (successful < n_iterations) {
-    warning(sprintf(
-      "Reached the maximum attempt cap (%d); only %d/%d paths succeeded. Consider relaxing the split conditions or lowering k_order",
-      max_attempts, successful, n_iterations
-    ))
-    
-    if (length(error_messages) > 0L) {
-      warning(sprintf(
-        "First splitting failure messages:\n%s",
-        paste(utils::head(unique(error_messages), 5L), collapse = "\n")
-      ))
-    }
-  }
-  
-  message(sprintf("Random sampling finished: %d successes, %d total attempts",
-                  successful, attempts))
-  
-  # ── Assemble the final result object ──────────────────────────────────────
+  # -- Assemble the final result object --------------------------------------
   result <- list(
     origin_value = origin_value,  # baseline statistic on the original data
     k_order      = k_order,       # split order of this analysis
     distribution = results        # step-by-step record of all successful paths
   )
   
-  # ── Save the result as an .rds file ───────────────────────────────────────
+  # -- Save the result as an .rds file ---------------------------------------
   if (is.null(save_path)) {
     save_path <- sprintf("splitting_sensitivity_k%d_%s.rds",
                          k_order,
@@ -1128,12 +1377,12 @@ continuous_reassignment_operation <- function(
   # Reassign a continuous amount of area by splitting a source region and
   # merging one split part into a neighboring target region.
   
-  # ── Input validation ────────────────────────────────────────────────────
+  # -- Input validation ----------------------------------------------------
   if (!inherits(sf, "sf"))              stop("Input must be an sf object")
   summary_field <- validate_summary_fields(sf, summary_field)
   if (!is.function(summary_function))   stop("summary_function must be a function")
   
-  # ── Initialize state variables ──────────────────────────────────────────
+  # -- Initialize state variables ------------------------------------------
   tol             <- tol_ratio * alpha   # absolute tolerance derived from alpha
   remaining_alpha <- alpha               # area budget still to be reassigned
   failure         <- 0L                  # cumulative failed attempts
@@ -1143,7 +1392,7 @@ continuous_reassignment_operation <- function(
   current_sf      <- sf                  # working copy of the sf object
   step_log_list   <- list()              # per-step log entries (assembled at the end)
   
-  # ── Compute baseline summary statistic ──────────────────────────────────
+  # -- Compute baseline summary statistic ----------------------------------
   stat_before <- tryCatch(
     call_summary_function(sf, summary_field, summary_function),
     error = function(e) stop(paste0("summary_function failed: ", e$message))
@@ -1151,7 +1400,7 @@ continuous_reassignment_operation <- function(
   current_stat       <- stat_before
   termination_reason <- NA_character_
   
-  # ── Main reassignment loop ──────────────────────────────────────────────
+  # -- Main reassignment loop ----------------------------------------------
   # The loop terminates when any of the following holds:
   #   (a) too many cumulative failures (`failure  >= max_iter`),
   #   (b) too many overall iterations  (`total_iter >= max_iter`),
@@ -1168,7 +1417,7 @@ continuous_reassignment_operation <- function(
       break
     }
     
-    source_id  <- sample(candidates, 1)
+    source_id  <- candidates[sample.int(length(candidates), 1L)]
     source_row <- which(current_sf$ID == source_id)
     
     # ---- Identify topological neighbors of the source -----------------
@@ -1222,7 +1471,7 @@ continuous_reassignment_operation <- function(
       valid_target_ids <- intersect(pre_neighbor_ids, split_result$ID)
       if (length(valid_target_ids) == 0L) next
       
-      target_id <- sample(valid_target_ids, 1)
+      target_id <- valid_target_ids[sample.int(length(valid_target_ids), 1L)]
       part_id   <- part_to_merge$ID
       
       # Attempt the merge; on failure, try the next sub-part.
@@ -1268,19 +1517,19 @@ continuous_reassignment_operation <- function(
     if (!success) failure <- failure + 1L
   }
   
-  # ── Determine termination reason ────────────────────────────────────────
+  # -- Determine termination reason ----------------------------------------
   if (is.na(termination_reason)) {
     termination_reason <- if (abs(remaining_alpha) <= tol) "success" else "max_iter reached"
   }
   
-  # ── Final statistics on the resulting sf ────────────────────────────────
+  # -- Final statistics on the resulting sf --------------------------------
   converged  <- abs(remaining_alpha) <= tol
   stat_after <- tryCatch(
     call_summary_function(current_sf, summary_field, summary_function),
     error = function(e) NA_real_
   )
   
-  # ── Assemble the step log ───────────────────────────────────────────────
+  # -- Assemble the step log -----------------------------------------------
   # When no successful step was recorded, return an empty data.frame whose
   # schema matches the populated case exactly. This lets downstream code
   # rbind results across runs without hitting column-mismatch errors.
@@ -1295,7 +1544,7 @@ continuous_reassignment_operation <- function(
     )
   }
   
-  # ── Return result bundle ────────────────────────────────────────────────
+  # -- Return result bundle ------------------------------------------------
   return(list(
     converged          = converged,
     termination_reason = termination_reason,
@@ -1321,12 +1570,14 @@ continuous_reassignment_sensitivity <- function(
     random_seed  = NULL,
     parallel     = FALSE,
     n_workers    = default_parallel_workers(),
-    save_path    = NULL
+    save_path    = NULL,
+    max_attempts = NULL
 ) {
+  n_iterations <- validate_monte_carlo_sample_count(n_iterations)
   # Run repeated continuous reassignment simulations and summarize the
   # resulting distribution of the selected statistic.
   
-  # ── Input validation ────────────────────────────────────────────────────
+  # -- Input validation ----------------------------------------------------
   if (!inherits(sf, "sf"))
     stop("Input must be an sf object")
   if (!is.function(summary_function))
@@ -1350,7 +1601,7 @@ continuous_reassignment_sensitivity <- function(
   max_iter     <- as.integer(max_iter)
   tol_ratio    <- as.numeric(tol_ratio)
   
-  # ── Compute baseline statistic ──────────────────────────────────────────
+  # -- Compute baseline statistic ------------------------------------------
   # Recorded once on the untouched data so every iteration's result can be
   # compared against a single, stable reference value.
   origin_value <- tryCatch(
@@ -1359,7 +1610,7 @@ continuous_reassignment_sensitivity <- function(
   )
   message(sprintf("Baseline statistic: %.6f", origin_value))
   
-  # ── Initialize result container ─────────────────────────────────────────
+  # -- Initialize result container -----------------------------------------
   attempt_results <- data.frame(
     iteration       = integer(0),
     summary_value   = numeric(0),
@@ -1376,7 +1627,7 @@ continuous_reassignment_sensitivity <- function(
     n_iterations
   ))
   
-  # ── Main loop ───────────────────────────────────────────────────────────
+  # -- Main loop -----------------------------------------------------------
   # Each iteration starts from the original `sf` (not the previous result),
   # so the n_iterations runs are mutually independent Monte-Carlo samples.
   sf_local               <- sf
@@ -1418,6 +1669,10 @@ continuous_reassignment_sensitivity <- function(
     
     if (is.list(res) && !is.null(res$error)) return(res)
     
+    if (!is.numeric(res$stat_after) || length(res$stat_after) != 1L) {
+      return(list(error = sprintf("Run %d returned a non-scalar numeric statistic", run)))
+    }
+
     data.frame(
       iteration       = run,
       summary_value   = res$stat_after,
@@ -1430,16 +1685,21 @@ continuous_reassignment_sensitivity <- function(
     )
   }
   
-  run_results <- run_monte_carlo(
-    X              = seq_len(n_iterations),
+  sampled <- collect_valid_monte_carlo(
+    n_iterations = n_iterations,
     FUN            = run_one_continuous,
     parallel       = parallel,
     n_workers      = n_workers,
     random_seed    = random_seed,
     export_names   = summary_function_export_names(summary_function),
     export_env     = environment(summary_function),
-    progress_label = "Continuous reassignment sensitivity"
+    packages       = c("sf", "spdep", "lwgeom"),
+    progress_label = "Continuous reassignment sensitivity",
+    valid_result = function(x) is.data.frame(x) && nrow(x) == 1L &&
+      isTRUE(x$converged) && is_finite_monte_carlo_statistic(x$summary_value),
+    max_attempts = max_attempts
   )
+  run_results <- sampled$attempts
   
   error_messages <- vapply(
     Filter(function(x) is.list(x) && !is.null(x$error), run_results),
@@ -1465,6 +1725,13 @@ continuous_reassignment_sensitivity <- function(
 
   n_converged     <- nrow(results)
   n_nonconverged  <- sum(!attempt_results$converged)
+  # Converged paths with invalid statistics are failed result computations.
+  # Nonconverged paths remain in their own category even if their value is NA.
+  invalid_summary <- attempt_results$converged & !is.finite(attempt_results$summary_value)
+  error_messages <- c(error_messages, sprintf(
+    "Run %d converged in area but its final statistic was non-finite",
+    attempt_results$iteration[invalid_summary]
+  ))
   n_worker_errors <- length(error_messages)
 
   message(sprintf(
@@ -1502,12 +1769,15 @@ continuous_reassignment_sensitivity <- function(
     summary_field = summary_field,
     diagnostics  = list(
       requested_iterations = n_iterations,
+      total_attempts       = sampled$total_attempts,
+      max_attempts         = sampled$max_attempts,
       converged_runs       = n_converged,
       nonconverged_runs    = n_nonconverged,
       worker_errors        = n_worker_errors,
       attempts             = attempt_results[
         , c(
           "iteration",
+          "summary_value",
           "converged",
           "termination_reason",
           "total_failure",
@@ -1520,7 +1790,7 @@ continuous_reassignment_sensitivity <- function(
     )
   )
   
-  # ── Persist to disk (optional) ──────────────────────────────────────────
+  # -- Persist to disk (optional) ------------------------------------------
   if (!is.null(save_path)) {
     save_dir <- dirname(save_path)
     if (nzchar(save_dir) && !dir.exists(save_dir)) {
@@ -1545,24 +1815,24 @@ discrete_reassignment_operation <- function(
   # Move one fine unit from its current coarse unit to a neighboring coarse
   # unit, then update coarse-level attributes and geometries.
   
-  # ── Locate source coarse polygon ────────────────────────────────────────
+  # -- Locate source coarse polygon ----------------------------------------
   # `coarse_id` is the polygon that currently owns the fine unit `i`.
   # If it cannot be found in sf_coarse, abort by returning NULL so the
   # caller can decide how to handle the missed reassignment.
   coarse_row <- which(sf_coarse$ID == coarse_id)
   if (length(coarse_row) == 0L) return(NULL)
   
-  # ── Pick a neighboring coarse polygon as the reassignment target ────────
+  # -- Pick a neighboring coarse polygon as the reassignment target --------
   # Only topological neighbors (precomputed via st_touches) are valid
   # targets — this preserves spatial contiguity of the resulting zoning.
   neighbor_idx <- neighbor_list[[coarse_row]]
   valid_nb_ids <- sf_coarse$ID[neighbor_idx]
   if (length(valid_nb_ids) == 0L) return(NULL)   # isolated coarse polygon
   
-  target_id  <- sample(valid_nb_ids, 1)
+  target_id  <- valid_nb_ids[sample.int(length(valid_nb_ids), 1L)]
   target_row <- which(sf_coarse$ID == target_id)
   
-  # ── Reassign the fine unit at the lookup table level ────────────────────
+  # -- Reassign the fine unit at the lookup table level --------------------
   # The fine layer is unchanged geometrically; only its parent ID flips.
   sf_fine$coarse_ID[i] <- target_id
   
@@ -1571,7 +1841,7 @@ discrete_reassignment_operation <- function(
   source_fine_rows <- which(sf_fine$coarse_ID == coarse_id)
   target_fine_rows <- which(sf_fine$coarse_ID == target_id)
   
-  # ── Recompute coarse-level fields per merge rule ────────────────────────
+  # -- Recompute coarse-level fields per merge rule ------------------------
   # Two rule shapes are supported:
   #   (a) "sum"  → re-aggregate from the fine layer (extensive variable).
   #   (b) list(numerator, denominator) → recompute as a ratio from
@@ -1613,7 +1883,7 @@ discrete_reassignment_operation <- function(
     }
   }
   
-  # ── Rebuild coarse geometries from their fine-unit members ──────────────
+  # -- Rebuild coarse geometries from their fine-unit members --------------
   # Source geometry is only rebuilt if it still owns at least one fine
   # unit; otherwise its old geometry is left in place and the caller
   # should treat it as "logically empty" (its summary fields are NA).
@@ -1641,12 +1911,14 @@ discrete_reassignment_sensitivity_area <- function(
     random_seed = NULL,
     parallel   = FALSE,
     n_workers  = default_parallel_workers(),
-    save_path  = NULL        # If non-NULL, results are saved as a .rds file
+    save_path  = NULL, # If non-NULL, results are saved as a .rds file
+    max_attempts = NULL
 ) {
+  n_iterations <- validate_monte_carlo_sample_count(n_iterations)
   # Run discrete reassignment simulations constrained by a total reassigned
   # area budget and summarize the statistic after each simulation.
   
-  # ── Input validation ────────────────────────────────────────────────────
+  # -- Input validation ----------------------------------------------------
   if (!inherits(finer_sf,   "sf")) stop("finer_sf must be an sf object")
   if (!inherits(coarser_sf, "sf")) stop("coarser_sf must be an sf object")
   summary_field <- validate_summary_fields(coarser_sf, summary_field, "coarser_sf")
@@ -1663,7 +1935,7 @@ discrete_reassignment_sensitivity_area <- function(
   
   n_iterations <- as.integer(n_iterations)
   delta_alpha  <- tol_ratio * alpha
-  # ── Baseline statistic & precomputation ─────────────────────────────────
+  # -- Baseline statistic & precomputation ---------------------------------
   origin_value  <- call_summary_function(coarser_sf, summary_field, summary_function)
   neighbor_list <- st_touches(coarser_sf, sparse = TRUE)
   fine_areas    <- as.numeric(st_area(finer_sf))
@@ -1694,7 +1966,7 @@ discrete_reassignment_sensitivity_area <- function(
     attempt_error   <- NULL
 
     while (remaining > 0 && length(available_ids) > 0L) {
-      fine_id  <- sample(available_ids, 1)
+      fine_id  <- available_ids[sample.int(length(available_ids), 1L)]
       fine_row <- which(current_fine$ID == fine_id)
       area_i   <- fine_areas_local[fine_row]
 
@@ -1756,25 +2028,29 @@ discrete_reassignment_sensitivity_area <- function(
     )
   }
 
-  results <- run_monte_carlo(
-    X              = seq_len(n_iterations),
+  sampled <- collect_valid_monte_carlo(
+    n_iterations = n_iterations,
     FUN            = run_one_discrete_area,
     parallel       = parallel,
     n_workers      = n_workers,
     random_seed    = random_seed,
     export_names   = summary_function_export_names(summary_function),
     export_env     = environment(summary_function),
-    progress_label = "Discrete reassignment sensitivity by area"
+    progress_label = "Discrete reassignment sensitivity by area",
+    valid_result = function(x) is.list(x) &&
+      is_finite_monte_carlo_statistic(x$stat_after),
+    max_attempts = max_attempts
   )
+  results <- sampled$results
   error_messages <- vapply(
-    Filter(function(x) is.list(x) && !is.null(x$error), results),
+    Filter(function(x) is.list(x) && !is.null(x$error), sampled$attempts),
     function(x) x$error,
     character(1)
   )
   results <- Filter(function(x) is.list(x) && !is.null(x$stat_after), results)
   success_count <- length(results)
 
-  # ── Assemble distribution & deviation summary ───────────────────────────
+  # -- Assemble distribution & deviation summary ---------------------------
   valid <- Filter(function(x) is.list(x) && !is.null(x$stat_after), results)
   distribution <- if (length(valid) > 0L) {
     data.frame(summary_value = vapply(valid, function(x) x$stat_after, numeric(1)))
@@ -1805,7 +2081,7 @@ discrete_reassignment_sensitivity_area <- function(
     maps          = if (keep_maps) lapply(valid, `[[`, "updated_sf") else NULL
   )
   
-  # ── Persist to disk (optional) ──────────────────────────────────────────
+  # -- Persist to disk (optional) ------------------------------------------
   # The save step is placed at the very end so that even if writing to disk
   # fails, the function can still return the result object to the caller.
   # The parent directory is created automatically; dir.create is silent if
@@ -1831,12 +2107,14 @@ discrete_reassignment_sensitivity_regions <- function(
     random_seed = NULL,
     parallel    = FALSE,
     n_workers   = default_parallel_workers(),
-    save_path = NULL          # If non-NULL, results are saved as a .rds file
+    save_path = NULL, # If non-NULL, results are saved as a .rds file
+    max_attempts = NULL
 ) {
+  n_iterations <- validate_monte_carlo_sample_count(n_iterations)
   # Run discrete reassignment simulations constrained by the number of fine
   # regions moved and summarize the statistic after each simulation.
   
-  # ── Input validation ────────────────────────────────────────────────────
+  # -- Input validation ----------------------------------------------------
   if (!inherits(finer_sf,   "sf")) stop("finer_sf must be an sf object")
   if (!inherits(coarser_sf, "sf")) stop("coarser_sf must be an sf object")
   summary_field <- validate_summary_fields(coarser_sf, summary_field, "coarser_sf")
@@ -1849,9 +2127,13 @@ discrete_reassignment_sensitivity_regions <- function(
   if (!is.null(save_path) && !is.character(save_path))
     stop("save_path must be a character string path or NULL")
   
+  if (length(k_regions) != 1L || !is.finite(k_regions) ||
+      k_regions != floor(k_regions) || k_regions > nrow(finer_sf)) {
+    stop("k_regions must be one positive integer <= the number of fine regions")
+  }
   k_regions    <- as.integer(k_regions)
   n_iterations <- as.integer(n_iterations)
-  # ── Baseline statistic & precomputation ─────────────────────────────────
+  # -- Baseline statistic & precomputation ---------------------------------
   origin_value  <- call_summary_function(coarser_sf, summary_field, summary_function)
   neighbor_list <- st_touches(coarser_sf, sparse = TRUE)
   field_rules_local      <- field_rules
@@ -1867,11 +2149,11 @@ discrete_reassignment_sensitivity_regions <- function(
     current_fine   <- finer_sf
     current_coarse <- coarser_sf
     
-    sampled_ids <- sample(
-      current_fine$ID,
-      size    = min(k_regions, nrow(current_fine)),
+    sampled_ids <- current_fine$ID[sample.int(
+      nrow(current_fine),
+      size    = k_regions,
       replace = FALSE
-    )
+    )]
     
     for (fine_id in sampled_ids) {
       
@@ -1891,7 +2173,9 @@ discrete_reassignment_sensitivity_regions <- function(
         error = function(e) NULL
       )
       
-      if (is.null(result)) next
+      if (is.null(result)) {
+        return(list(error = sprintf("Iteration %d could not complete %d fine-region moves", iter, k_regions)))
+      }
       
       current_fine   <- result$sf_fine
       current_coarse <- result$sf_coarse
@@ -1900,23 +2184,23 @@ discrete_reassignment_sensitivity_regions <- function(
     call_summary_fn(current_coarse, summary_field_local, summary_function_local)
   }
   
-  distribution <- unlist(run_monte_carlo(
-    X              = seq_len(n_iterations),
-    FUN            = run_one_discrete_region,
-    parallel       = parallel,
-    n_workers      = n_workers,
-    random_seed    = random_seed,
-    export_names   = summary_function_export_names(summary_function),
-    export_env     = environment(summary_function),
-    progress_label = "Discrete reassignment sensitivity by number of regions"
-  ))
+  sampled <- collect_valid_monte_carlo(
+    FUN = run_one_discrete_region, n_iterations = n_iterations,
+    valid_result = is_finite_monte_carlo_statistic,
+    parallel = parallel, n_workers = n_workers, random_seed = random_seed,
+    export_names = summary_function_export_names(summary_function),
+    export_env = environment(summary_function),
+    progress_label = "Discrete reassignment sensitivity by number of regions",
+    max_attempts = max_attempts
+  )
+  distribution <- vapply(sampled$results, identity, numeric(1L))
   
   out <- list(
     origin_value = origin_value,
     distribution = data.frame(summary_value = distribution)
   )
   
-  # ── Persist to disk (optional) ──────────────────────────────────────────
+  # -- Persist to disk (optional) ------------------------------------------
   if (!is.null(save_path)) {
     dir.create(dirname(save_path), recursive = TRUE, showWarnings = FALSE)
     saveRDS(out, file = save_path)
