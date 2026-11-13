@@ -2,7 +2,7 @@
 # Vector sensitivity calculation functions
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-10-13
+# 2026-11-12
 
 # Please cite the following reference when part or all of the code in this file
 # is reused under the license of CC-BY-4.0:
@@ -82,6 +82,10 @@ call_summary_function <- function(sf, summary_field, summary_function) {
   do.call(summary_function, unname(args))
 }
 
+# -- Shared Monte Carlo execution core ---------------------------------------
+# Keep this block identical in the dated vector and raster calculation modules.
+# Simulation validity and sample collection remain the responsibility of callers.
+
 default_parallel_workers <- function(reserve_cores = 10L) {
   # Choose a worker count from the detected logical cores, leaving the
   # requested number free. Fall back to one worker if detection is unavailable.
@@ -120,7 +124,7 @@ create_monte_carlo_executor <- function(FUN,
                                         random_seed = NULL,
                                         export_names = character(),
                                         export_env = .GlobalEnv,
-                                        packages = c("sf", "spdep"),
+                                        packages = character(),
                                         progress_label = "Monte Carlo") {
   # Prepare a reusable record containing the task and its execution settings.
   # FUN performs one complete simulation; this function does not run it or
@@ -155,8 +159,8 @@ create_monte_carlo_executor <- function(FUN,
   }
 
   # -- Resolve dependencies before starting workers ------------------------
-  # Vector tasks use sf and spdep by default. Callers can add other
-  # dependencies, such as lwgeom for polygon splitting.
+  # The caller supplies package dependencies; this shared core does not
+  # assume a vector or raster representation. No packages are loaded by default.
   packages <- unique(packages)
   missing_packages <- packages[
     !vapply(packages, requireNamespace, logical(1L), quietly = TRUE)
@@ -306,7 +310,7 @@ run_monte_carlo <- function(X,
                             executor = NULL,
                             progress = TRUE,
                             chunk_size = NULL,
-                            packages = c("sf", "spdep")) {
+                            packages = character()) {
   # Execute one submission of independent tasks and return a list in input
   # order. Each element of X is passed to FUN; no results are filtered here.
 
@@ -889,6 +893,8 @@ merging_sensitivity <- function(sf,
         id_i    <- temp_sf$ID[i_index]
         id_j    <- temp_sf$ID[j_index]
         
+        # Merge the selected units using the field aggregation rules;
+        # stop this path and retain the error message if the merge fails.
         temp_sf <- tryCatch(
           merge_op(temp_sf, id_i, id_j, field_rules_local),
           error = function(e) {
@@ -907,6 +913,8 @@ merging_sensitivity <- function(sf,
         
         new_id <- max(temp_sf$ID, na.rm = TRUE)
         
+        # Recalculate the statistic for the updated zoning and record
+        # the merged IDs and statistic at this step of the path.
         current_value <- tryCatch({
           call_summary_fn(temp_sf, summary_field_local, summary_function_local)
         }, error = function(e) {
@@ -938,6 +946,8 @@ merging_sensitivity <- function(sf,
       do.call(rbind, iter_rows)
     }
     
+    # Collect complete k-step paths with valid statistics, retrying
+    # unsuccessful attempts within the specified attempt limit.
     sampled <- collect_valid_monte_carlo(
       n_iterations = n_iterations,
       FUN            = run_one_merge_path,
@@ -1261,6 +1271,8 @@ splitting_sensitivity <- function(sf,
         break
       }
 
+      # Randomly select a unit from the current zoning and retain the
+      # existing IDs so the new units can be identified after splitting.
       i_index    <- sample(seq_len(nrow(temp_sf)), 1)
       id_i       <- temp_sf$ID[i_index]
       ids_before <- temp_sf$ID
@@ -1283,10 +1295,14 @@ splitting_sensitivity <- function(sf,
         break
       }
 
+      # Compare IDs before and after the split to identify the two
+      # newly created units for the step log.
       new_ids <- sort(setdiff(temp_sf$ID, ids_before))
       new1    <- if (length(new_ids) >= 1) new_ids[1] else NA_integer_
       new2    <- if (length(new_ids) >= 2) new_ids[2] else NA_integer_
 
+      # Recalculate the statistic after splitting and record it with
+      # the parent and child IDs at the current split order.
       current_value <- tryCatch(
         call_summary_fn(temp_sf, summary_field_local, summary_function_local),
         error = function(e) {
@@ -1970,6 +1986,8 @@ discrete_reassignment_sensitivity_area <- function(
       fine_row <- which(current_fine$ID == fine_id)
       area_i   <- fine_areas_local[fine_row]
 
+      # Exclude units that exceed the remaining area budget; the budget
+      # can only decrease, so these units cannot become eligible later.
       if (area_i > remaining) {
         available_ids <- setdiff(available_ids, fine_id)
         next
@@ -2001,6 +2019,8 @@ discrete_reassignment_sensitivity_area <- function(
         next
       }
 
+      # Charge only successful reassignments to the area budget and
+      # update both spatial layers; each fine unit can be moved once.
       remaining      <- remaining - area_i
       current_fine   <- result$sf_fine
       current_coarse <- result$sf_coarse
@@ -2018,6 +2038,8 @@ discrete_reassignment_sensitivity_area <- function(
       return(list(error = attempt_error))
     }
 
+    # Calculate the statistic on the updated coarse units and retain
+    # their spatial data only when map output has been requested.
     list(
       stat_after = call_summary_fn(
         current_coarse,
