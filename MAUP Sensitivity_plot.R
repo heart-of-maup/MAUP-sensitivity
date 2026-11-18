@@ -2,7 +2,7 @@
 # Shared plotting functions for vector and raster sensitivity results
 # YE, Xiang 叶翔; CHEN, Jiayi 陈佳怡
 # yexiang@nnu.edu.cn
-# 2026-11-12
+# 2026-11-16
 
 # Please cite the following reference when part or all of the code in this file
 # is reused under the license of CC-BY-4.0:
@@ -80,18 +80,25 @@ sensitivity_result_value_column <- function(distribution) {
 }
 
 
-default_sensitivity_panel_label <- function(result_obj, fallback = "Sensitivity") {
+default_sensitivity_panel_label <- function(result_obj, fallback = "") {
   # Derive an informative panel label from result metadata when the caller has
   # not supplied one explicitly.
 
   if (!is.null(result_obj$alpha_multiplier)) {
-    return(paste0("alpha = ", format(result_obj$alpha_multiplier), "s"))
+    return(paste0("\u03b1 = ", format(result_obj$alpha_multiplier), "s"))
   }
 
   if (!is.null(result_obj$k_pixels)) {
     return(paste0("k = ", result_obj$k_pixels, " pixels"))
   }
 
+  if (!is.null(result_obj$k_order)) {
+    return(paste0("k = ", result_obj$k_order))
+  }
+  # Collection keys such as k3 identify orders, not display titles.
+  if (grepl("^k[0-9]+$", fallback)) {
+    return(sub("^k", "k = ", fallback))
+  }
   fallback
 }
 
@@ -188,8 +195,12 @@ standardize_sensitivity_result <- function(result_obj = NULL,
 
     # A single high-order result contains one distribution for each k level;
     # use k itself as the panel label so all orders remain visible.
-    if (any(is.finite(standardized$k))) {
-      standardized$panel <- paste0("k = ", standardized$k)
+    if (is.null(panel_labels) && any(is.finite(standardized$k))) {
+      standardized$panel <- if (all(standardized$k == 1, na.rm = TRUE)) {
+        ""
+      } else {
+        paste0("k = ", standardized$k)
+      }
     }
 
     standardized$panel <- factor(
@@ -235,16 +246,9 @@ standardize_sensitivity_result <- function(result_obj = NULL,
 }
 
 
-calculate_sensitivity_plot_range <- function(ratio, x_range = NULL, show_all = TRUE) {
-  # Show every finite simulation result by default, including extreme tails.
-  # When show_all = FALSE, plotting limits use the 0.1st and 99.9th percentiles
-  # with padding for visualization only; simulations outside the displayed
-  # range remain in the underlying result and all statistical calculations.
-  # An explicit x_range takes precedence over either automatic range mode.
-
-  if (!is.logical(show_all) || length(show_all) != 1L || is.na(show_all)) {
-    stop("show_all must be TRUE or FALSE.")
-  }
+calculate_sensitivity_plot_range <- function(ratio, x_range = NULL) {
+  # Use robust tail quantiles by default so isolated extreme simulations do not
+  # compress the main distribution. Add padding for legible panel boundaries.
 
   if (!is.null(x_range)) {
     if (!is.numeric(x_range) || length(x_range) != 2L ||
@@ -254,20 +258,15 @@ calculate_sensitivity_plot_range <- function(ratio, x_range = NULL, show_all = T
     return(as.numeric(x_range))
   }
 
-  finite_ratio <- ratio[is.finite(ratio)]
-  if (length(finite_ratio) == 0L) {
-    stop("At least one finite ratio is required to calculate the plot range.")
-  }
-  plot_range <- if (show_all) {
-    range(finite_ratio)
-  } else {
-    as.numeric(stats::quantile(
-      finite_ratio, probs = c(0.001, 0.999), names = FALSE
-    ))
-  }
+  plot_range <- as.numeric(stats::quantile(
+    ratio,
+    probs = c(0.001, 0.999),
+    na.rm = TRUE,
+    names = FALSE
+  ))
 
   if (!all(is.finite(plot_range)) || plot_range[1L] == plot_range[2L]) {
-    center <- plot_range[1L]
+    center <- mean(ratio, na.rm = TRUE)
     padding <- max(abs(center) * 0.01, 0.01)
     return(center + c(-padding, padding))
   }
@@ -286,8 +285,7 @@ build_sensitivity_distribution_plot <- function(plot_data,
                                                 show_stats = TRUE,
                                                 vline_at = 1,
                                                 vline_color = "red",
-                                                x_title = "Summary function (standardized)",
-                                                show_all = TRUE) {
+                                                x_title = "Summary function (standardized)") {
   # Build the shared histogram-density figure after all result formats have
   # been normalized. This is the only function that defines plot geometry and
   # styling, preventing vector and raster plotting code from diverging.
@@ -300,9 +298,7 @@ build_sensitivity_distribution_plot <- function(plot_data,
     stop("bins must be one positive integer.")
   }
 
-  x_range <- calculate_sensitivity_plot_range(
-    plot_data$ratio, x_range = x_range, show_all = show_all
-  )
+  x_range <- calculate_sensitivity_plot_range(plot_data$ratio, x_range)
   binwidth <- diff(x_range) / as.integer(bins)
 
   panel_sd <- stats::aggregate(
@@ -317,32 +313,13 @@ build_sensitivity_distribution_plot <- function(plot_data,
     ""
   }
 
-  # A common count-to-density conversion is valid only for equal panel sizes.
-  # When successful sample counts differ, use density units for both layers
-  # and one shared axis so panel sample size cannot distort their comparison.
+  # Histogram counts and probability density use different units. Multiplying
+  # density by the largest panel size and bin width places both on a comparable
+  # visual scale while retaining density units on the secondary axis.
   panel_sizes <- table(plot_data$panel)
-  panel_sizes <- panel_sizes[panel_sizes > 0L]
-  equal_panel_sizes <- length(unique(as.numeric(panel_sizes))) == 1L
-  density_scale <- if (equal_panel_sizes) as.numeric(panel_sizes[1L]) * binwidth else 1
+  density_scale <- max(as.numeric(panel_sizes)) * binwidth
   if (!is.finite(density_scale) || density_scale <= 0) {
     density_scale <- 1
-  }
-  histogram_mapping <- if (equal_panel_sizes) {
-    ggplot2::aes(y = ggplot2::after_stat(count))
-  } else {
-    ggplot2::aes(y = ggplot2::after_stat(density))
-  }
-  y_scale <- if (equal_panel_sizes) {
-    ggplot2::scale_y_continuous(
-      name = "Frequency",
-      sec.axis = ggplot2::sec_axis(~ . / density_scale, name = "Density"),
-      expand = ggplot2::expansion(mult = c(0, 0.12))
-    )
-  } else {
-    ggplot2::scale_y_continuous(
-      name = "Density",
-      expand = ggplot2::expansion(mult = c(0, 0.12))
-    )
   }
 
   plot_object <- ggplot2::ggplot(plot_data, ggplot2::aes(x = ratio)) +
@@ -352,7 +329,7 @@ build_sensitivity_distribution_plot <- function(plot_data,
       alpha = 0.7,
       color = "white",
       linewidth = 0.3,
-      histogram_mapping
+      ggplot2::aes(y = ggplot2::after_stat(count))
     ) +
     ggplot2::geom_density(
       ggplot2::aes(y = ggplot2::after_stat(density) * density_scale),
@@ -367,25 +344,28 @@ build_sensitivity_distribution_plot <- function(plot_data,
       linetype = "dashed",
       linewidth = 0.5
     ) +
-    ggplot2::geom_text(
-      data = panel_sd,
-      ggplot2::aes(x = x_range[1L], y = Inf, label = label),
-      inherit.aes = FALSE,
-      hjust = 0,
-      vjust = 1.25,
-      family = base_family,
-      fontface = "bold",
-      size = 3
+    ggplot2::scale_x_continuous(
+      limits = range(c(plot_data$ratio, x_range[1L], vline_at), finite = TRUE),
+      oob = function(x, range) x
     ) +
-    # Crop the viewing window after computing all layers from the full data.
-    ggplot2::coord_cartesian(xlim = x_range, clip = "on") +
-    ggplot2::facet_wrap(~ panel, ncol = as.integer(ncol), scales = "fixed") +
-    y_scale +
+    ggplot2::coord_cartesian(xlim = x_range, clip = "off") +
+    ggplot2::scale_y_continuous(
+      name = "Frequency",
+      # Counts need integer tick positions, not rounded fractional labels.
+      breaks = function(limits) {
+        ticks <- unique(round(pretty(limits, n = 5)))
+        ticks[ticks >= 0]
+      },
+      labels = function(x) format(x, scientific = FALSE, trim = TRUE),
+      sec.axis = ggplot2::sec_axis(~ . / density_scale, name = "Density"),
+      expand = ggplot2::expansion(mult = c(0, 0.12))
+    ) +
     ggplot2::labs(x = x_title) +
     ggplot2::theme_minimal(base_family = base_family) +
     ggplot2::theme(
       text = ggplot2::element_text(family = base_family, size = 9),
-      strip.text = ggplot2::element_text(size = 9, face = "plain"),
+      plot.title = ggplot2::element_text(hjust = 0.5, size = 9, face = "plain"),
+      plot.subtitle = ggplot2::element_text(hjust = 0, size = 9, face = "bold"),
       axis.title.x = ggplot2::element_text(size = 9, margin = ggplot2::margin(t = 7)),
       axis.title.y.left = ggplot2::element_text(size = 9, margin = ggplot2::margin(r = 6)),
       axis.title.y.right = ggplot2::element_text(size = 9, margin = ggplot2::margin(l = 6)),
@@ -395,7 +375,49 @@ build_sensitivity_distribution_plot <- function(plot_data,
       plot.margin = ggplot2::margin(t = 6, r = 14, b = 12, l = 10)
     )
 
-  plot_object
+  # Restore actual subtitles above the axes, as in the original plotter.
+  # Keep the shared bin width, density scale, and y range across all panels.
+  panel_levels <- levels(droplevels(factor(plot_data$panel)))
+  panels <- lapply(panel_levels, function(label) {
+    one_panel <- plot_data[as.character(plot_data$panel) == label, , drop = FALSE]
+    subtitle <- panel_sd$label[as.character(panel_sd$panel) == label]
+    panel_plot <- plot_object
+    panel_plot$data <- one_panel
+    panel_plot + ggplot2::labs(
+      title = if (nzchar(label)) label else NULL,
+      subtitle = if (isTRUE(show_stats)) subtitle else NULL
+    )
+  })
+  if (length(panels) == 1L) return(panels[[1L]])
+
+  y_max <- max(vapply(panels, function(p) {
+    built <- ggplot2::ggplot_build(p)
+    max(c(built$data[[1L]]$y, built$data[[2L]]$y), na.rm = TRUE)
+  }, numeric(1L)))
+  panels <- lapply(panels, function(p) {
+    p$coordinates <- ggplot2::coord_cartesian(
+      xlim = x_range, ylim = c(0, y_max), clip = "off"
+    )
+    p
+  })
+  # Defer text measurement until drawing on the actual output device.
+  grid::gTree(plots = panels, ncol = as.integer(ncol), cl = "sensitivity_panels")
+}
+
+
+makeContent.sensitivity_panels <- function(x) {
+  grobs <- lapply(x$plots, ggplot2::ggplotGrob)
+  common_widths <- do.call(grid::unit.pmax, lapply(grobs, function(g) g$widths))
+  grobs <- lapply(grobs, function(g) { g$widths <- common_widths; g })
+  ncol <- max(1L, min(x$ncol, length(grobs)))
+  nrow <- ceiling(length(grobs) / ncol)
+  cells <- c(grobs, rep(list(grid::nullGrob()), nrow * ncol - length(grobs)))
+  combined <- gtable::gtable_matrix(
+    "sensitivity_panels", matrix(cells, nrow = nrow, ncol = ncol, byrow = TRUE),
+    widths = grid::unit(rep(1, ncol), "null"),
+    heights = grid::unit(rep(1, nrow), "null")
+  )
+  grid::setChildren(x, grid::gList(combined))
 }
 
 
@@ -457,15 +479,12 @@ plot_sensitivity_distribution <- function(
     show_stats = TRUE,
     vline_at = 1,
     vline_color = "red",
-    x_title = "Summary function (standardized)",
-    show_all = TRUE
+    x_title = "Summary function (standardized)"
 ) {
   # Plot any supported vector or raster sensitivity result. A single result,
   # result collection, or corresponding .rds file is accepted through the same
-  # public interface.
-  # show_all = TRUE includes the full finite range by default. FALSE selects
-  # a percentile-based viewing window without removing any observations.
-  # Set x_range explicitly to override either automatic viewing window.
+  # public interface. Single panels return a ggplot; multi-panel figures return
+  # a grid grob (display with grid::grid.draw(), save with ggsave()).
 
   collection_mode <- match.arg(collection_mode)
   plot_data <- standardize_sensitivity_result(
@@ -491,8 +510,7 @@ plot_sensitivity_distribution <- function(
     show_stats = show_stats,
     vline_at = vline_at,
     vline_color = vline_color,
-    x_title = x_title,
-    show_all = show_all
+    x_title = x_title
   )
 
   save_sensitivity_plot(
@@ -508,11 +526,10 @@ plot_sensitivity_distribution <- function(
 }
 
 
-plot_sensitivity_grid <- function(..., ncol = 1L, show_all = TRUE) {
+plot_sensitivity_grid <- function(..., ncol = 1L) {
   # Plot a multi-result or multi-order sensitivity figure. This convenience
   # interface uses the same data normalization and plot engine as
   # plot_sensitivity_distribution().
-  # show_all controls the viewing window only; simulation results are retained.
 
-  plot_sensitivity_distribution(..., ncol = ncol, show_all = show_all)
+  plot_sensitivity_distribution(..., ncol = ncol)
 }
